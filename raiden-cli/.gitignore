@@ -1,0 +1,10 @@
+node_modules/
+build*/
+storage/
+
+*.vim
+
+src/deployment/*
+src/abi/*
+
+docs/
