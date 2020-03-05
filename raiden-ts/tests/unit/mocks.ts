@@ -8,6 +8,7 @@ import { AsyncSubject, of, BehaviorSubject } from 'rxjs';
 import { MatrixClient } from 'matrix-js-sdk';
 import { EventEmitter } from 'events';
 import { memoize } from 'lodash';
+import logging from 'loglevel';
 
 jest.mock('ethers/providers');
 import { JsonRpcProvider, EventType, Listener } from 'ethers/providers';
@@ -20,12 +21,15 @@ import { TokenNetworkRegistry } from 'raiden-ts/contracts/TokenNetworkRegistry';
 import { TokenNetwork } from 'raiden-ts/contracts/TokenNetwork';
 import { HumanStandardToken } from 'raiden-ts/contracts/HumanStandardToken';
 import { ServiceRegistry } from 'raiden-ts/contracts/ServiceRegistry';
+import { UserDeposit } from 'raiden-ts/contracts/UserDeposit';
+import { SecretRegistry } from 'raiden-ts/contracts/SecretRegistry';
 
 import { TokenNetworkRegistryFactory } from 'raiden-ts/contracts/TokenNetworkRegistryFactory';
 import { TokenNetworkFactory } from 'raiden-ts/contracts/TokenNetworkFactory';
 import { HumanStandardTokenFactory } from 'raiden-ts/contracts/HumanStandardTokenFactory';
 import { ServiceRegistryFactory } from 'raiden-ts/contracts/ServiceRegistryFactory';
 import { UserDepositFactory } from 'raiden-ts/contracts/UserDepositFactory';
+import { SecretRegistryFactory } from 'raiden-ts/contracts/SecretRegistryFactory';
 
 import 'raiden-ts/polyfills';
 import { RaidenEpicDeps, ContractsInfo } from 'raiden-ts/types';
@@ -33,7 +37,6 @@ import { makeInitialState } from 'raiden-ts/state';
 import { Address, Signature } from 'raiden-ts/utils/types';
 import { getServerName } from 'raiden-ts/utils/matrix';
 import { pluckDistinct } from 'raiden-ts/utils/rx';
-import { UserDeposit } from 'raiden-ts/contracts/UserDeposit';
 import { raidenConfigUpdate, RaidenAction } from 'raiden-ts/actions';
 import { Presences } from 'raiden-ts/transport/types';
 import { makeDefaultConfig } from 'raiden-ts/config';
@@ -55,6 +58,7 @@ export interface MockRaidenEpicDeps extends RaidenEpicDeps {
   getTokenContract: (address: string) => MockedContract<HumanStandardToken>;
   serviceRegistryContract: MockedContract<ServiceRegistry>;
   userDepositContract: MockedContract<UserDeposit>;
+  secretRegistryContract: MockedContract<SecretRegistry>;
 }
 
 /**
@@ -129,6 +133,7 @@ export function raidenEpicDeps(): MockRaidenEpicDeps {
     provider,
   );
   const address = signer.address as Address;
+  const log = logging.getLogger(`raiden:${address}`);
 
   const registryAddress = '0xregistry';
   const registryContract = TokenNetworkRegistryFactory.connect(
@@ -190,6 +195,14 @@ export function raidenEpicDeps(): MockRaidenEpicDeps {
     '0x0A0000000000000000000000000000000000000a',
   );
 
+  const secretRegistryContract = SecretRegistryFactory.connect(address, signer) as MockedContract<
+    SecretRegistry
+  >;
+
+  for (const func in secretRegistryContract.functions) {
+    jest.spyOn(secretRegistryContract.functions, func as keyof SecretRegistry['functions']);
+  }
+
   const contractsInfo: ContractsInfo = {
       TokenNetworkRegistry: {
         address: registryContract.address as Address,
@@ -201,6 +214,10 @@ export function raidenEpicDeps(): MockRaidenEpicDeps {
       },
       UserDeposit: {
         address: userDepositContract.address as Address,
+        block_number: 102,
+      },
+      SecretRegistry: {
+        address: secretRegistryContract.address as Address,
         block_number: 102,
       },
     },
@@ -219,7 +236,7 @@ export function raidenEpicDeps(): MockRaidenEpicDeps {
     defaultConfig = makeDefaultConfig({ network });
 
   const latest$: RaidenEpicDeps['latest$'] = new BehaviorSubject({
-      action: raidenConfigUpdate({ config: {} }) as RaidenAction,
+      action: raidenConfigUpdate({}) as RaidenAction,
       state,
       config: { ...defaultConfig, ...state.config },
       presences: {} as Presences,
@@ -235,6 +252,7 @@ export function raidenEpicDeps(): MockRaidenEpicDeps {
     config$,
     matrix$: new AsyncSubject<MatrixClient>(),
     address,
+    log,
     network,
     contractsInfo,
     provider,
@@ -244,6 +262,7 @@ export function raidenEpicDeps(): MockRaidenEpicDeps {
     getTokenContract,
     serviceRegistryContract,
     userDepositContract,
+    secretRegistryContract,
   };
 }
 

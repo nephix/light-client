@@ -3,8 +3,7 @@ import * as t from 'io-ts';
 import { BigNumber, bigNumberify, getAddress, isHexString, hexDataLength } from 'ethers/utils';
 import { Two, Zero } from 'ethers/constants';
 import { memoize } from 'lodash';
-import { Either, Right, map } from 'fp-ts/lib/Either';
-import { pipe } from 'fp-ts/lib/pipeable';
+import { Either, Right } from 'fp-ts/lib/Either';
 import { ThrowReporter } from 'io-ts/lib/ThrowReporter';
 
 /* A Subset of DOM's Storage/localStorage interface which supports async/await */
@@ -24,9 +23,15 @@ export class AssertionError extends Error {}
  *
  * @param condition - Condition to validate as truthy
  * @param msg - Message to throw if condition is falsy
+ * @param log - Logger to log error to
  */
-export function assert(condition: any, msg?: string): asserts condition {
+export function assert(
+  condition: any,
+  msg?: string,
+  log?: (...args: any[]) => void,
+): asserts condition {
   if (!condition) {
+    log?.('AssertionError', condition, msg);
     throw new AssertionError(msg ?? 'AssertionError');
   }
 }
@@ -59,31 +64,6 @@ export function isntNil<T>(value: T): value is NonNullable<T> {
   return value != null;
 }
 
-const serializedErr = t.intersection([
-  t.type({ name: t.string, message: t.string }),
-  t.partial({ stack: t.string }),
-]);
-
-/**
- * Simple Error codec
- *
- * This codec doesn't decode to an instance of the exact same error class object, but instead to
- * a generic Error, but assigning 'name', 'stack' & 'message' properties, more as an informative
- * object.
- */
-export const ErrorCodec = new t.Type<Error, { name: string; message: string; stack?: string }>(
-  'Error',
-  (u: unknown): u is Error => u instanceof Error,
-  u => {
-    if (u instanceof Error) return t.success(u);
-    return pipe(
-      serializedErr.decode(u),
-      map(({ name, message, stack }) => Object.assign(new Error(message), { name, stack })),
-    );
-  },
-  e => ({ name: e.name, message: e.message, stack: e.stack }),
-);
-
 /**
  * Codec of ethers.utils.BigNumber objects
  *
@@ -98,9 +78,9 @@ export const BigNumberC = new t.Type<BigNumber, string>(
     if (BigNumber.isBigNumber(u)) return t.success(u);
     try {
       // decode by trying to bigNumberify string representation of anything
-      return t.success(bigNumberify((u as any).toString()));
+      return t.success(bigNumberify(((u as any)?._hex ?? (u as any)).toString()));
     } catch (err) {
-      return t.failure(u, c, err.message);
+      return t.failure(u, c);
     }
   },
   a => a.toString(),
@@ -123,9 +103,9 @@ export interface HexStringB<S extends number> extends SizedB<S> {
  * @param size - Required number of bytes. Pass undefined or zero to have a variable-sized type
  * @returns branded codec for hex-encoded bytestrings
  */
-export const HexString = memoize<
-  <S extends number = number>(size?: S) => t.BrandC<t.StringC, HexStringB<S>>
->(function<S extends number = number>(size?: S) {
+export const HexString: <S extends number = number>(
+  size?: S,
+) => t.BrandC<t.StringC, HexStringB<S>> = memoize(function<S extends number = number>(size?: S) {
   return t.brand(
     t.string,
     (n): n is string & t.Brand<HexStringB<S>> =>
@@ -149,9 +129,9 @@ export interface IntB<S extends number> extends SizedB<S> {
  * @param size - Required number of bytes. Pass undefined to have a variable-sized type
  * @returns branded codec for hex-encoded bytestrings
  */
-export const Int = memoize<
-  <S extends number = number>(size?: S) => t.BrandC<typeof BigNumberC, IntB<S>>
->(function<S extends number = number>(size?: S) {
+export const Int: <S extends number = number>(
+  size?: S,
+) => t.BrandC<typeof BigNumberC, IntB<S>> = memoize(function<S extends number = number>(size?: S) {
   const min = size ? Zero.sub(Two.pow(size * 8 - 1)) : undefined,
     max = size ? Two.pow(size * 8 - 1) : undefined;
   return t.brand(
@@ -175,9 +155,11 @@ export interface UIntB<S extends number> extends SizedB<S> {
  * @param size - Required number of bytes. Pass undefined to have a variable-sized type
  * @returns branded codec for hex-encoded bytestrings
  */
-export const UInt = memoize<
-  <S extends number = number>(size?: S) => t.BrandC<typeof BigNumberC, UIntB<S>>
->(function<S extends number = number>(size?: S) {
+export const UInt: <S extends number = number>(
+  size?: S,
+) => t.BrandC<typeof BigNumberC, UIntB<S>> = memoize(function<S extends number = number>(
+  size?: S,
+) {
   const min = size ? Zero : undefined,
     max = size ? Two.pow(size * 8) : undefined;
   return t.brand(
@@ -199,9 +181,9 @@ export type Signature = string & t.Brand<HexStringB<65>>;
 export const Hash = HexString(32);
 export type Hash = string & t.Brand<HexStringB<32>>;
 
-// string brand: a secret bytearray, non-sized
-export const Secret = HexString();
-export type Secret = string & t.Brand<HexStringB<number>>;
+// string brand: a secret bytearray, 32 bytes
+export const Secret = HexString(32);
+export type Secret = string & t.Brand<HexStringB<32>>;
 
 // string brand: ECDSA private key, 32 bytes
 export const PrivateKey = HexString(32);
@@ -213,17 +195,29 @@ export interface AddressB {
 }
 
 // string brand: checksummed address, 20 bytes
-export const Address = t.brand(
-  HexString(20),
-  (u): u is HexString<20> & t.Brand<AddressB> => {
-    try {
-      return typeof u === 'string' && getAddress(u) === u;
-    } catch (e) {}
-    return false;
-  }, // type guard for branded values
-  'Address', // the name must match the readonly field in the brand
-);
 export type Address = string & t.Brand<HexStringB<20>> & t.Brand<AddressB>;
+export const Address = new t.Type<Address, string>(
+  'Address',
+  (u: unknown): u is Address => {
+    try {
+      return HexString(20).is(u) && getAddress(u) === u;
+    } catch (e) {
+      return false;
+    }
+  },
+  (u, c) => {
+    if (!HexString(20).is(u)) return t.failure(u, c);
+    let addr;
+    try {
+      addr = getAddress(u);
+    } catch (e) {
+      return t.failure(u, c);
+    }
+    if (!addr) return t.failure(u, c);
+    return t.success(addr as Address);
+  },
+  t.identity,
+);
 
 /**
  * Helper function to create codecs to validate [timestamp, value] tuples
@@ -231,8 +225,10 @@ export type Address = string & t.Brand<HexStringB<20>> & t.Brand<AddressB>;
  * @param codec - Codec to compose with a timestamp in a tuple
  * @returns Codec of a tuple of timestamp and codec type
  */
-export const Timed = memoize<<T extends t.Mixed>(codec: T) => t.TupleC<[t.NumberC, T]>>(
-  <T extends t.Mixed>(codec: T) => t.tuple([t.number, codec]),
+export const Timed: <T extends t.Mixed>(
+  codec: T,
+) => t.TupleC<[t.NumberC, T]> = memoize(<T extends t.Mixed>(codec: T) =>
+  t.tuple([t.number, codec]),
 );
 export type Timed<T> = [number, T];
 
@@ -249,20 +245,18 @@ export function timed<T>(v: T): Timed<T> {
 // generic type codec for messages that must be signed
 // use it like: Codec = Signed(Message)
 // The t.TypeOf<typeof codec> will be Signed<Message>, defined later
-export const Signed = memoize<
-  <C extends t.Mixed>(
-    codec: C,
-  ) => t.IntersectionC<
-    [
-      C,
-      t.ReadonlyC<
-        t.TypeC<{
-          signature: typeof Signature;
-        }>
-      >,
-    ]
-  >
->(<C extends t.Mixed>(codec: C) =>
+export const Signed: <C extends t.Mixed>(
+  codec: C,
+) => t.IntersectionC<
+  [
+    C,
+    t.ReadonlyC<
+      t.TypeC<{
+        signature: typeof Signature;
+      }>
+    >,
+  ]
+> = memoize(<C extends t.Mixed>(codec: C) =>
   t.intersection([codec, t.readonly(t.type({ signature: Signature }))]),
 );
 export type Signed<M> = M & { signature: Signature };

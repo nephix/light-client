@@ -9,14 +9,15 @@ import {
   LockExpired,
   RefundTransfer,
   Metadata,
+  SecretRequest,
 } from '../messages/types';
-import { Address, Timed, Hash, Int, Signed } from '../utils/types';
+import { Address, Timed, Hash, Int, Signed, Secret } from '../utils/types';
 
 /**
  * This struct holds the relevant messages exchanged in a transfer
  * The transfer state is defined by the exchanged messages
  */
-export const SentTransfer = t.readonly(
+export const TransferState = t.readonly(
   t.intersection([
     t.type({
       /** -> outgoing locked transfer */
@@ -24,6 +25,11 @@ export const SentTransfer = t.readonly(
       fee: Int(32),
     }),
     t.partial({
+      /**
+       * Transfer secret, if known
+       * registerBlock is 0 if not yet registered on-chain
+       * */
+      secret: Timed(t.type({ value: Secret, registerBlock: t.number })),
       /** <- incoming processed for locked transfer */
       transferProcessed: Timed(Signed(Processed)),
       /**
@@ -39,6 +45,12 @@ export const SentTransfer = t.readonly(
        * CloseChannel transaction. No further actions are possible after it's set.
        */
       channelClosed: Timed(Hash),
+      /**
+       * <- incoming secret request from target
+       * If this is set, it means the target requested the secret, not necessarily with a valid
+       * amount (an invalid amount < value == lock - fee, means transfer failed)
+       */
+      secretRequest: Timed(Signed(SecretRequest)),
       /**
        * -> outgoing secret reveal to target
        * If this is set, it means the secret was revealed (so transfer succeeded, even if it didn't
@@ -71,20 +83,22 @@ export const SentTransfer = t.readonly(
     }),
   ]),
 );
-export type SentTransfer = t.TypeOf<typeof SentTransfer>;
+export type TransferState = t.TypeOf<typeof TransferState>;
 
 /**
  * Mapping of outgoing transfers, indexed by the secrethash
  */
-export const SentTransfers = t.readonly(t.record(t.string /* secrethash: Hash */, SentTransfer));
-export type SentTransfers = t.TypeOf<typeof SentTransfers>;
+export const TransfersState = t.readonly(t.record(t.string /* secrethash: Hash */, TransferState));
+export type TransfersState = t.TypeOf<typeof TransfersState>;
 
-export enum RaidenSentTransferStatus {
+export enum RaidenTransferStatus {
   pending = 'PENDING', // transfer was just sent
   received = 'RECEIVED', // transfer acknowledged by partner
   refunded = 'REFUNDED', // partner informed that can't forward transfer
   closed = 'CLOSED', // channel closed before revealing
-  revealed = 'REVEALED', // secret asked and revealed to target
+  requested = 'REQUESTED', // secret requested by target
+  revealed = 'REVEALED', // secret revealed to target
+  registered = 'REGISTERED', // secret registered on-chain before lock's expiration
   unlocking = 'UNLOCKING', // unlock sent to partner
   expiring = 'EXPIRING', // lock expired sent to partner
   unlocked = 'UNLOCKED', // unlock acknowledged by partner (complete with success)
@@ -96,11 +110,12 @@ export enum RaidenSentTransferStatus {
  *
  * This should be only used as a public view of the internal transfer state
  */
-export interface RaidenSentTransfer {
+export interface RaidenTransfer {
   secrethash: Hash; // used as transfer identifier
-  status: RaidenSentTransferStatus;
+  direction: 'sent' | 'received';
+  status: RaidenTransferStatus;
   initiator: Address; // us
-  recipient: Address; // receiver/partner/hub
+  partner: Address; // receiver/partner/hub
   target: Address; // final receiver of the transfer
   metadata: Metadata; // chosen routes
   paymentId: BigNumber;

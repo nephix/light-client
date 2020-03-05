@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/camelcase */
 import * as t from 'io-ts';
-import { combineLatest, defer, EMPTY, from, merge, Observable, of } from 'rxjs';
+import { defer, EMPTY, from, merge, Observable, of } from 'rxjs';
 import {
   catchError,
   concatMap,
@@ -13,9 +13,7 @@ import {
   map,
   mergeMap,
   pluck,
-  publishReplay,
   scan,
-  startWith,
   switchMap,
   tap,
   timeout,
@@ -26,23 +24,23 @@ import { Signer } from 'ethers';
 import { Event } from 'ethers/contract';
 import { BigNumber, bigNumberify, toUtf8Bytes, verifyMessage, concat } from 'ethers/utils';
 import { Two, Zero } from 'ethers/constants';
-import { memoize, get } from 'lodash';
+import { memoize } from 'lodash';
 
 import { UserDeposit } from '../contracts/UserDeposit';
 import { RaidenAction } from '../actions';
 import { RaidenState } from '../state';
 import { RaidenEpicDeps } from '../types';
-import { getPresences$ } from '../transport/utils';
 import { messageGlobalSend } from '../messages/actions';
 import { MessageType, PFSCapacityUpdate } from '../messages/types';
 import { MessageTypeId, signMessage } from '../messages/utils';
-import { channelDeposit } from '../channels/actions';
-import { ChannelState } from '../channels/state';
+import { ChannelState, Channel } from '../channels/state';
 import { channelAmounts } from '../channels/utils';
-import { Address, decode, Int, Signature, Signed, UInt } from '../utils/types';
+import { Address, decode, Int, Signature, Signed, UInt, isntNil } from '../utils/types';
 import { isActionOf } from '../utils/actions';
 import { encode, losslessParse, losslessStringify } from '../utils/data';
 import { getEventsStream } from '../utils/ethers';
+import { RaidenError, ErrorCodes } from '../utils/error';
+import { pluckDistinct } from '../utils/rx';
 import { iouClear, pathFind, iouPersist, pfsListUpdated } from './actions';
 import { channelCanRoute, pfsInfo, pfsListInfo } from './utils';
 import { IOU, LastIOUResults, PathResults, Paths, PFS } from './types';
@@ -113,17 +111,15 @@ const makeAndSignLastIOURequest$ = (sender: Address, receiver: Address, signer: 
 const prepareNextIOU$ = (
   pfs: PFS,
   tokenNetwork: Address,
-  state$: Observable<RaidenState>,
-  deps: RaidenEpicDeps,
+  { address, signer, network, userDepositContract, latest$ }: RaidenEpicDeps,
 ): Observable<Signed<IOU>> => {
-  return state$.pipe(
-    withLatestFrom(deps.config$),
+  return latest$.pipe(
     first(),
-    switchMap(([state, { httpTimeout }]) => {
-      const cachedIOU: IOU | undefined = get(state.path.iou, [tokenNetwork, pfs.address]);
+    switchMap(({ state, config: { httpTimeout } }) => {
+      const cachedIOU: IOU | undefined = state.path.iou[tokenNetwork]?.[pfs.address];
       return (cachedIOU
         ? of(cachedIOU)
-        : makeAndSignLastIOURequest$(deps.address, pfs.address, deps.signer).pipe(
+        : makeAndSignLastIOURequest$(address, pfs.address, signer).pipe(
             mergeMap(payload =>
               fromFetch(
                 `${pfs.url}/api/v1/${tokenNetwork}/payment/iou?${new URLSearchParams(
@@ -135,35 +131,37 @@ const prepareNextIOU$ = (
                 },
               ).pipe(timeout(httpTimeout)),
             ),
-            withLatestFrom(state$),
+            withLatestFrom(latest$.pipe(pluck('state'))),
             mergeMap(async ([response, { blockNumber }]) => {
               if (response.status === 404) {
                 return makeIOU(
-                  deps.address,
+                  address,
                   pfs.address,
-                  deps.network.chainId,
-                  await oneToNAddress(deps.userDepositContract),
+                  network.chainId,
+                  await oneToNAddress(userDepositContract),
                   blockNumber,
                 );
               }
               const text = await response.text();
               if (!response.ok)
-                throw new Error(
-                  `PFS: last IOU request: code=${response.status} => body="${text}"`,
-                );
+                throw new RaidenError(ErrorCodes.PFS_LAST_IOU_REQUEST_FAILED, {
+                  responseStatus: response.status,
+                  responseText: text,
+                });
 
               const { last_iou: lastIou } = decode(LastIOUResults, losslessParse(text));
               const signer = verifyMessage(packIOU(lastIou), lastIou.signature);
-              if (signer !== deps.address)
-                throw new Error(
-                  `PFS: last iou signature mismatch: signer=${signer} instead of us ${deps.address}`,
-                );
+              if (signer !== address)
+                throw new RaidenError(ErrorCodes.PFS_IOU_SIGNATURE_MISMATCH, {
+                  signer,
+                  address,
+                });
               return lastIou;
             }),
           )
       ).pipe(
         map(iou => updateIOU(iou, pfs.price)),
-        mergeMap(iou => signIOU$(iou, deps.signer)),
+        mergeMap(iou => signIOU$(iou, signer)),
       );
     }),
   );
@@ -179,205 +177,209 @@ const prepareNextIOU$ = (
  */
 export const pathFindServiceEpic = (
   action$: Observable<RaidenAction>,
-  state$: Observable<RaidenState>,
+  {}: Observable<RaidenState>,
   deps: RaidenEpicDeps,
-): Observable<pathFind.success | pathFind.failure | iouPersist | iouClear> =>
-  combineLatest(
-    state$,
-    getPresences$(action$),
-    deps.config$, // don't need to be cached, but here to avoid separate withLatestFrom
-    action$.pipe(
-      filter(isActionOf(pfsListUpdated)),
-      pluck('payload', 'pfsList'),
-      startWith([] as readonly Address[]),
-    ),
-  ).pipe(
-    publishReplay(1, undefined, cached$ => {
-      return action$.pipe(
-        filter(isActionOf(pathFind.request)),
-        concatMap(action =>
-          cached$.pipe(
-            first(),
-            mergeMap(([state, presences, { pfs: configPfs, httpTimeout, pfsSafetyMargin }]) => {
-              const { tokenNetwork, target } = action.meta;
-              if (!(tokenNetwork in state.channels))
-                throw new Error(`PFS: unknown tokenNetwork ${tokenNetwork}`);
-              if (!(target in presences) || !presences[target].payload.available)
-                throw new Error(`PFS: target ${target} not online`);
+): Observable<pathFind.success | pathFind.failure | iouPersist | iouClear> => {
+  const { log, latest$ } = deps;
+  return action$.pipe(
+    filter(isActionOf(pathFind.request)),
+    concatMap(action =>
+      latest$.pipe(
+        first(),
+        mergeMap(
+          ({ state, presences, config: { pfs: configPfs, httpTimeout, pfsSafetyMargin } }) => {
+            const { tokenNetwork, target } = action.meta;
+            if (!(tokenNetwork in state.channels))
+              throw new RaidenError(ErrorCodes.PFS_UNKNOWN_TOKEN_NETWORK, { tokenNetwork });
+            if (!(target in presences) || !presences[target].payload.available)
+              throw new RaidenError(ErrorCodes.PFS_TARGET_OFFLINE, { target });
 
-              // if pathFind received a set of paths, pass it through to validation/cleanup
-              if (action.payload.paths) return of({ paths: action.payload.paths, iou: undefined });
-              // else, if possible, use a direct transfer
-              else if (
-                channelCanRoute(state, presences, tokenNetwork, target, action.meta.value) === true
-              ) {
-                return of({
-                  paths: [{ path: [deps.address, target], fee: Zero as Int<32> }],
-                  iou: undefined,
-                });
-              } else if (
-                action.payload.pfs === null || // explicitly disabled in action
-                (!action.payload.pfs && configPfs === null) // disabled in config and not provided
-              ) {
-                // pfs not specified in action and disabled (null) in config
-                throw new Error(`PFS disabled and no direct route available`);
-              } else {
-                // else, request a route from PFS.
-                // pfs$ - Observable which emits one PFS info and then completes
-                const pfs$ = action.payload.pfs
-                  ? // first, honor action.payload.pfs
-                    of(action.payload.pfs)
-                  : configPfs != null
-                  ? // or if config.pfs isn't disabled nor auto (undefined), use it
-                    // configPfs is addr or url, so fetch pfsInfo from it
-                    pfsInfo(configPfs, deps)
-                  : // else (config.pfs undefined, auto mode)
-                    cached$.pipe(
-                      pluck(3), // get cached pfsList (4th combined value)
-                      // if needed, wait for list to be populated
-                      first(pfsList => pfsList.length > 0),
-                      // fetch pfsInfo from whole list & sort it
-                      mergeMap(pfsList => pfsListInfo(pfsList, deps)),
-                      tap(pfss => console.log('Auto-selecting best PFS from:', pfss)),
-                      // pop best ranked
-                      pluck(0),
-                    );
-                return pfs$.pipe(
-                  mergeMap(pfs =>
-                    pfs.price.isZero()
-                      ? of({ pfs, iou: undefined })
-                      : prepareNextIOU$(
-                          pfs,
-                          tokenNetwork,
-                          cached$.pipe(pluck(0)) /* cached state$ */,
-                          deps,
-                        ).pipe(map(iou => ({ pfs, iou }))),
+            // if pathFind received a set of paths, pass it through to validation/cleanup
+            if (action.payload.paths) return of({ paths: action.payload.paths, iou: undefined });
+            // else, if possible, use a direct transfer
+            else if (
+              channelCanRoute(state, presences, tokenNetwork, target, action.meta.value) === true
+            ) {
+              return of({
+                paths: [{ path: [deps.address, target], fee: Zero as Int<32> }],
+                iou: undefined,
+              });
+            } else if (
+              action.payload.pfs === null || // explicitly disabled in action
+              (!action.payload.pfs && configPfs === null) // disabled in config and not provided
+            ) {
+              // pfs not specified in action and disabled (null) in config
+              throw new RaidenError(ErrorCodes.PFS_DISABLED);
+            } else {
+              // else, request a route from PFS.
+              // pfs$ - Observable which emits one PFS info and then completes
+              const pfs$ = action.payload.pfs
+                ? // first, honor action.payload.pfs
+                  of(action.payload.pfs)
+                : configPfs != null
+                ? // or if config.pfs isn't disabled nor auto (undefined), use it
+                  // configPfs is addr or url, so fetch pfsInfo from it
+                  pfsInfo(configPfs, deps)
+                : // else (config.pfs undefined, auto mode)
+                  latest$.pipe(
+                    pluck('pfsList'), // get cached pfsList
+                    // if needed, wait for list to be populated
+                    first(pfsList => pfsList.length > 0),
+                    // fetch pfsInfo from whole list & sort it
+                    mergeMap(pfsList => pfsListInfo(pfsList, deps)),
+                    tap(pfss => log.info('Auto-selecting best PFS from:', pfss)),
+                    // pop best ranked
+                    pluck(0),
+                  );
+              return pfs$.pipe(
+                mergeMap(pfs =>
+                  pfs.price.isZero()
+                    ? of({ pfs, iou: undefined })
+                    : prepareNextIOU$(pfs, tokenNetwork, deps).pipe(map(iou => ({ pfs, iou }))),
+                ),
+                mergeMap(({ pfs, iou }) =>
+                  fromFetch(`${pfs.url}/api/v1/${tokenNetwork}/paths`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: losslessStringify({
+                      from: deps.address,
+                      to: target,
+                      value: UInt(32).encode(action.meta.value),
+                      max_paths: 10,
+                      iou: iou
+                        ? {
+                            ...iou,
+                            amount: UInt(32).encode(iou.amount),
+                            expiration_block: UInt(32).encode(iou.expiration_block),
+                            chain_id: UInt(32).encode(iou.chain_id),
+                          }
+                        : undefined,
+                    }),
+                  }).pipe(
+                    timeout(httpTimeout),
+                    map(response => ({ response, iou })),
                   ),
-                  mergeMap(({ pfs, iou }) =>
-                    fromFetch(`${pfs.url}/api/v1/${tokenNetwork}/paths`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: losslessStringify({
-                        from: deps.address,
-                        to: target,
-                        value: UInt(32).encode(action.meta.value),
-                        max_paths: 10,
-                        iou: iou
-                          ? {
-                              ...iou,
-                              amount: UInt(32).encode(iou.amount),
-                              expiration_block: UInt(32).encode(iou.expiration_block),
-                              chain_id: UInt(32).encode(iou.chain_id),
-                            }
-                          : undefined,
-                      }),
-                    }).pipe(
-                      timeout(httpTimeout),
-                      map(response => ({ response, iou })),
+                ),
+                mergeMap(async ({ response, iou }) => ({
+                  response,
+                  text: await response.text(),
+                  iou,
+                })),
+                map(({ response, text, iou }) => {
+                  // any decode error here will throw early and end up in catchError
+                  const data = losslessParse(text);
+                  if (!response.ok) {
+                    return { error: decode(PathError, data), iou };
+                  }
+                  return {
+                    paths: decode(PathResults, data).result.map(
+                      r =>
+                        ({
+                          path: r.path,
+                          // Add PFS safety margin to estimated fees
+                          fee: r.estimated_fee
+                            .mul(Math.round(pfsSafetyMargin * 1e6))
+                            .div(1e6) as Int<32>,
+                        } as const),
                     ),
-                  ),
-                  mergeMap(async ({ response, iou }) => ({
-                    response,
-                    text: await response.text(),
                     iou,
-                  })),
-                  map(({ response, text, iou }) => {
-                    // any decode error here will throw early and end up in catchError
-                    const data = losslessParse(text);
-                    if (!response.ok) {
-                      return { error: decode(PathError, data), iou };
-                    }
-                    return {
-                      paths: decode(PathResults, data).result.map(
-                        r =>
-                          ({
-                            path: r.path,
-                            // Add PFS safety margin to estimated fees
-                            fee: r.estimated_fee
-                              .mul(Math.round(pfsSafetyMargin * 1e6))
-                              .div(1e6) as Int<32>,
-                          } as const),
-                      ),
-                      iou,
-                    };
-                  }),
-                );
+                  };
+                }),
+              );
+            }
+          },
+        ),
+        withLatestFrom(latest$),
+        // validate/cleanup received routes/paths/results
+        mergeMap(([data, { state, presences }]) =>
+          // looks like mergeMap with generator doesn't handle exceptions correctly
+          // use from+iterator from iife generator instead
+          from(
+            (function*() {
+              const { iou } = data;
+              if (iou) {
+                // if not error or error_code of "no route found", iou accepted => persist
+                if (data.paths || data.error.error_code === 2201)
+                  yield iouPersist(
+                    { iou },
+                    { tokenNetwork: action.meta.tokenNetwork, serviceAddress: iou.receiver },
+                  );
+                // else (error and error_code of "iou rejected"), clear
+                else
+                  yield iouClear(undefined, {
+                    tokenNetwork: action.meta.tokenNetwork,
+                    serviceAddress: iou.receiver,
+                  });
               }
-            }),
-            withLatestFrom(cached$),
-            // validate/cleanup received routes/paths/results
-            mergeMap(([data, [state, presences]]) =>
-              // looks like mergeMap with generator doesn't handle exceptions correctly
-              // use from+iterator from iife generator instead
-              from(
-                (function*() {
-                  const { iou } = data;
-                  if (iou) {
-                    // if not error or error_code of "no route found", iou accepted => persist
-                    if (data.paths || data.error.error_code === 2201)
-                      yield iouPersist(
-                        { iou },
-                        { tokenNetwork: action.meta.tokenNetwork, serviceAddress: iou.receiver },
-                      );
-                    // else (error and error_code of "iou rejected"), clear
-                    else
-                      yield iouClear(undefined, {
-                        tokenNetwork: action.meta.tokenNetwork,
-                        serviceAddress: iou.receiver,
-                      });
-                  }
-                  // if error, don't proceed
-                  if (!data.paths) {
-                    throw new Error(
-                      `PFS: paths request: code=${data.error.error_code} => errors="${data.error.errors}"`,
-                    );
-                  }
-                  const filteredPaths: Paths = [],
-                    invalidatedRecipients = new Set<Address>();
-                  // eslint-disable-next-line prefer-const
-                  for (let { path, fee } of data.paths) {
-                    // if route has us as first hop, cleanup/shift
-                    if (path[0] === deps.address) path = path.slice(1);
-                    const recipient = path[0];
-                    // if this recipient was already invalidated in a previous iteration, skip
-                    if (invalidatedRecipients.has(recipient)) continue;
-                    // if we already found some valid route, allow only new routes through this peer
-                    const canTransferOrReason = !filteredPaths.length
-                      ? channelCanRoute(
-                          state,
-                          presences,
-                          action.meta.tokenNetwork,
-                          recipient,
-                          action.meta.value.add(fee) as UInt<32>,
-                        )
-                      : recipient !== filteredPaths[0].path[0]
-                      ? 'path: already selected another recipient'
-                      : fee.gt(filteredPaths[0].fee)
-                      ? 'path: already selected a smaller fee'
-                      : true;
-                    if (canTransferOrReason !== true) {
-                      console.log(
-                        'Invalidated received route. Reason:',
-                        canTransferOrReason,
-                        'Route:',
-                        path,
-                      );
-                      invalidatedRecipients.add(recipient);
-                      continue;
-                    }
-                    filteredPaths.push({ path, fee });
-                  }
-                  if (!filteredPaths.length) throw new Error(`PFS: no valid routes found`);
-                  yield pathFind.success({ paths: filteredPaths }, action.meta);
-                })(),
-              ),
-            ),
-            catchError(err => of(pathFind.failure(err, action.meta))),
+              // if error, don't proceed
+              if (!data.paths) {
+                throw new RaidenError(ErrorCodes.PFS_ERROR_RESPONSE, {
+                  errorCode: data.error.error_code,
+                  errors: data.error.errors,
+                });
+              }
+              const filteredPaths: Paths = [],
+                invalidatedRecipients = new Set<Address>();
+              // eslint-disable-next-line prefer-const
+              for (let { path, fee } of data.paths) {
+                // if route has us as first hop, cleanup/shift
+                if (path[0] === deps.address) path = path.slice(1);
+                const recipient = path[0];
+                // if this recipient was already invalidated in a previous iteration, skip
+                if (invalidatedRecipients.has(recipient)) continue;
+                // if we already found some valid route, allow only new routes through this peer
+                const canTransferOrReason = !filteredPaths.length
+                  ? channelCanRoute(
+                      state,
+                      presences,
+                      action.meta.tokenNetwork,
+                      recipient,
+                      action.meta.value.add(fee) as UInt<32>,
+                    )
+                  : recipient !== filteredPaths[0].path[0]
+                  ? 'path: already selected another recipient'
+                  : fee.gt(filteredPaths[0].fee)
+                  ? 'path: already selected a smaller fee'
+                  : true;
+                if (canTransferOrReason !== true) {
+                  log.warn(
+                    'Invalidated received route. Reason:',
+                    canTransferOrReason,
+                    'Route:',
+                    path,
+                  );
+                  invalidatedRecipients.add(recipient);
+                  continue;
+                }
+                filteredPaths.push({ path, fee });
+              }
+              if (!filteredPaths.length) throw new RaidenError(ErrorCodes.PFS_NO_ROUTES_FOUND);
+              yield pathFind.success({ paths: filteredPaths }, action.meta);
+            })(),
           ),
         ),
-      );
-    }),
+        catchError(err => of(pathFind.failure(err, action.meta))),
+      ),
+    ),
   );
+};
+
+function channelEntries(channels: RaidenState['channels']): ReadonlyArray<[string, Channel]> {
+  return Object.entries(channels)
+    .map(([tokenNetwork, partnerChannels]) =>
+      Object.entries(partnerChannels).map(
+        ([partner, channel]) => [`${partner}@${tokenNetwork}`, channel] as [string, Channel],
+      ),
+    )
+    .reduce((acc, val) => [...acc, ...val], []);
+}
+
+function keyToTNP(key: string): { key: string; tokenNetwork: Address; partnerAddr: Address } {
+  const [partner, tokenNetwork] = key.split('@');
+  return { key, tokenNetwork: tokenNetwork as Address, partnerAddr: partner as Address };
+}
+
+type ChangedChannel = Channel & ReturnType<typeof keyToTNP>;
 
 /**
  * Sends a [[PFSCapacityUpdate]] to PFS global room on new deposit on our side of channels
@@ -387,50 +389,71 @@ export const pathFindServiceEpic = (
  * @returns Observable of messageGlobalSend actions
  */
 export const pfsCapacityUpdateEpic = (
-  action$: Observable<RaidenAction>,
-  state$: Observable<RaidenState>,
-  { address, network, signer, config$ }: RaidenEpicDeps,
+  {}: Observable<RaidenAction>,
+  {}: Observable<RaidenState>,
+  { log, address, network, signer, config$, latest$ }: RaidenEpicDeps,
 ): Observable<messageGlobalSend> =>
-  action$.pipe(
-    filter(channelDeposit.success.is),
-    filter(action => !!action.payload.confirmed && action.payload.participant === address),
-    debounceTime(10e3),
-    withLatestFrom(state$, config$),
-    filter(([, , { pfsRoom }]) => !!pfsRoom), // ignore actions while/if config.pfsRoom isn't set
-    mergeMap(([action, state, { revealTimeout, pfsRoom }]) => {
-      const channel = state.channels[action.meta.tokenNetwork]?.[action.meta.partner];
-      if (!channel || channel.state !== ChannelState.open) return EMPTY;
+  latest$.pipe(
+    pluckDistinct('state', 'channels'),
+    concatMap(channels => from(channelEntries(channels))),
+    /* this scan stores a reference to each [key,value] in 'acc', and emit as 'changed' iff it
+     * changes from last time seen. It relies on value references changing only if needed */
+    scan(
+      ({ acc }, [key, channel]) =>
+        // if ref didn't change, emit previous accumulator, without 'changed' value
+        acc[key] === channel
+          ? { acc }
+          : // else, update ref in 'acc' and emit value in 'changed' prop
+            {
+              acc: { ...acc, [key]: channel },
+              changed: { ...channel, ...keyToTNP(key) } as ChangedChannel,
+            },
+      { acc: {} } as { acc: { [k: string]: Channel }; changed?: ChangedChannel },
+    ),
+    pluck('changed'),
+    filter(isntNil), // filter out if reference didn't change from last emit
+    groupBy(({ key }) => key),
+    withLatestFrom(config$),
+    mergeMap(([grouped$, { httpTimeout }]) =>
+      grouped$.pipe(
+        withLatestFrom(config$),
+        filter(([, { pfsRoom }]) => !!pfsRoom), // ignore actions while/if config.pfsRoom isn't set
+        debounceTime(httpTimeout / 2), // default: 15s
+        concatMap(([channel, { revealTimeout, pfsRoom }]) => {
+          const { tokenNetwork, partnerAddr: partner } = channel;
+          if (channel.state !== ChannelState.open) return EMPTY;
+          const { ownCapacity, partnerCapacity } = channelAmounts(channel);
 
-      const { ownCapacity, partnerCapacity } = channelAmounts(channel);
+          const message: PFSCapacityUpdate = {
+            type: MessageType.PFS_CAPACITY_UPDATE,
+            canonical_identifier: {
+              chain_identifier: bigNumberify(network.chainId) as UInt<32>,
+              token_network_address: tokenNetwork,
+              channel_identifier: bigNumberify(channel.id) as UInt<32>,
+            },
+            updating_participant: address,
+            other_participant: partner,
+            updating_nonce: channel.own.balanceProof
+              ? channel.own.balanceProof.nonce
+              : (Zero as UInt<8>),
+            other_nonce: channel.partner.balanceProof
+              ? channel.partner.balanceProof.nonce
+              : (Zero as UInt<8>),
+            updating_capacity: ownCapacity,
+            other_capacity: partnerCapacity,
+            reveal_timeout: bigNumberify(revealTimeout) as UInt<32>,
+          };
 
-      const message: PFSCapacityUpdate = {
-        type: MessageType.PFS_CAPACITY_UPDATE,
-        canonical_identifier: {
-          chain_identifier: bigNumberify(network.chainId) as UInt<32>,
-          token_network_address: action.meta.tokenNetwork,
-          channel_identifier: bigNumberify(channel.id) as UInt<32>,
-        },
-        updating_participant: address,
-        other_participant: action.meta.partner,
-        updating_nonce: channel.own.balanceProof
-          ? channel.own.balanceProof.nonce
-          : (Zero as UInt<8>),
-        other_nonce: channel.partner.balanceProof
-          ? channel.partner.balanceProof.nonce
-          : (Zero as UInt<8>),
-        updating_capacity: ownCapacity,
-        other_capacity: partnerCapacity,
-        reveal_timeout: bigNumberify(revealTimeout) as UInt<32>,
-      };
-
-      return from(signMessage(signer, message)).pipe(
-        map(signed => messageGlobalSend({ message: signed }, { roomName: pfsRoom! })),
-        catchError(err => {
-          console.error('Error trying to generate & sign PFSCapacityUpdate', err);
-          return EMPTY;
+          return defer(() => signMessage(signer, message, { log })).pipe(
+            map(signed => messageGlobalSend({ message: signed }, { roomName: pfsRoom! })),
+            catchError(err => {
+              log.error('Error trying to generate & sign PFSCapacityUpdate', err);
+              return EMPTY;
+            }),
+          );
         }),
-      );
-    }),
+      ),
+    ),
   );
 
 /**

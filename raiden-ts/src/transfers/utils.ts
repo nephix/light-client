@@ -4,7 +4,7 @@ import { keccak256, randomBytes, bigNumberify, sha256 } from 'ethers/utils';
 import { Hash, Secret, UInt, HexString } from '../utils/types';
 import { encode } from '../utils/data';
 import { Lock } from '../channels/types';
-import { SentTransfer, RaidenSentTransfer, RaidenSentTransferStatus } from './state';
+import { TransferState, RaidenTransfer, RaidenTransferStatus } from './state';
 
 /**
  * Get the locksroot of a given array of pending locks
@@ -59,55 +59,80 @@ export function makeMessageId(): UInt<8> {
   return bigNumberify(Date.now()) as UInt<8>;
 }
 
+function getTimeIfPresent<T>(k: keyof T): (o: T) => number | undefined {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (o: T) => (o[k] ? (o[k] as any)[0] : undefined);
+}
+
+const statusesMap: { [K in RaidenTransferStatus]: (s: TransferState) => number | undefined } = {
+  [RaidenTransferStatus.expired]: getTimeIfPresent<TransferState>('lockExpiredProcessed'),
+  [RaidenTransferStatus.unlocked]: getTimeIfPresent<TransferState>('unlockProcessed'),
+  [RaidenTransferStatus.expiring]: getTimeIfPresent<TransferState>('lockExpired'),
+  [RaidenTransferStatus.unlocking]: getTimeIfPresent<TransferState>('unlock'),
+  [RaidenTransferStatus.registered]: (sent: TransferState) =>
+    // only set status as registered if there's a valid registerBlock
+    sent.secret?.[1]?.registerBlock ? sent.secret[0] : undefined,
+  [RaidenTransferStatus.revealed]: getTimeIfPresent<TransferState>('secretReveal'),
+  [RaidenTransferStatus.requested]: getTimeIfPresent<TransferState>('secretRequest'),
+  [RaidenTransferStatus.closed]: getTimeIfPresent<TransferState>('channelClosed'),
+  [RaidenTransferStatus.refunded]: getTimeIfPresent<TransferState>('refund'),
+  [RaidenTransferStatus.received]: getTimeIfPresent<TransferState>('transferProcessed'),
+  [RaidenTransferStatus.pending]: getTimeIfPresent<TransferState>('transfer'),
+};
+
 /**
- * Convert a state.sent: SentTransfer to a public RaidenSentTransfer object
+ * Convert a state.sent: TransferState to a public RaidenTransfer object
  *
  * @param sent - RaidenState.sent value
  * @returns Public raiden sent transfer info object
  */
-export function raidenSentTransfer(sent: SentTransfer): RaidenSentTransfer {
-  const [status, changedAt]: [RaidenSentTransferStatus, number] = sent.lockExpiredProcessed
-      ? [RaidenSentTransferStatus.expired, sent.lockExpiredProcessed[0]]
-      : sent.unlockProcessed
-      ? [RaidenSentTransferStatus.unlocked, sent.unlockProcessed[0]]
-      : sent.lockExpired
-      ? [RaidenSentTransferStatus.expiring, sent.lockExpired[0]]
-      : sent.unlock
-      ? [RaidenSentTransferStatus.unlocking, sent.unlock[0]]
-      : sent.secretReveal
-      ? [RaidenSentTransferStatus.revealed, sent.secretReveal[0]]
-      : sent.channelClosed // channelClosed before revealing
-      ? [RaidenSentTransferStatus.closed, sent.channelClosed[0]]
-      : sent.refund
-      ? [RaidenSentTransferStatus.refunded, sent.refund[0]]
-      : sent.transferProcessed
-      ? [RaidenSentTransferStatus.received, sent.transferProcessed[0]]
-      : [RaidenSentTransferStatus.pending, sent.transfer[0]],
-    success: boolean | undefined =
-      sent.secretReveal || sent.unlock
-        ? true
-        : sent.refund || sent.lockExpired || sent.channelClosed
-        ? false
-        : undefined,
-    completed = !!(sent.unlockProcessed || sent.lockExpiredProcessed || sent.channelClosed);
+export function raidenSentTransfer(sent: TransferState): RaidenTransfer {
+  const startedAt = new Date(sent.transfer[0]);
+  let changedAt = startedAt;
+  let status = RaidenTransferStatus.pending;
+  // order matters! from top to bottom priority, first match breaks loop
+  for (const [s, g] of Object.entries(statusesMap)) {
+    const ts = g(sent);
+    if (ts !== undefined) {
+      status = s as RaidenTransferStatus;
+      changedAt = new Date(ts);
+      break;
+    }
+  }
+  const transfer = sent.transfer[1];
+  const value = transfer.lock.amount.sub(sent.fee);
+  const invalidSecretRequest = sent.secretRequest && sent.secretRequest[1].amount.lt(value);
+  const success =
+    sent.secretReveal || sent.unlock || sent.secret?.[1]?.registerBlock
+      ? true
+      : invalidSecretRequest || sent.refund || sent.lockExpired || sent.channelClosed
+      ? false
+      : undefined;
+  const completed = !!(
+    sent.unlockProcessed ||
+    sent.lockExpiredProcessed ||
+    sent.secret?.[1]?.registerBlock ||
+    sent.channelClosed
+  );
   return {
-    secrethash: sent.transfer[1].lock.secrethash,
+    secrethash: transfer.lock.secrethash,
+    direction: 'sent',
     status,
-    initiator: sent.transfer[1].initiator,
-    recipient: sent.transfer[1].recipient,
-    target: sent.transfer[1].target,
-    metadata: sent.transfer[1].metadata,
-    paymentId: sent.transfer[1].payment_identifier,
-    chainId: sent.transfer[1].chain_id.toNumber(),
-    token: sent.transfer[1].token,
-    tokenNetwork: sent.transfer[1].token_network_address,
-    channelId: sent.transfer[1].channel_identifier,
-    value: sent.transfer[1].lock.amount.sub(sent.fee),
+    initiator: transfer.initiator,
+    partner: transfer.recipient,
+    target: transfer.target,
+    metadata: transfer.metadata,
+    paymentId: transfer.payment_identifier,
+    chainId: transfer.chain_id.toNumber(),
+    token: transfer.token,
+    tokenNetwork: transfer.token_network_address,
+    channelId: transfer.channel_identifier,
+    value,
     fee: sent.fee,
-    amount: sent.transfer[1].lock.amount,
-    expirationBlock: sent.transfer[1].lock.expiration.toNumber(),
-    startedAt: new Date(sent.transfer[0]),
-    changedAt: new Date(changedAt),
+    amount: transfer.lock.amount,
+    expirationBlock: transfer.lock.expiration.toNumber(),
+    startedAt,
+    changedAt,
     success,
     completed,
   };

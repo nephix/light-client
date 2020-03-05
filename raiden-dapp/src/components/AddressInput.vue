@@ -3,7 +3,7 @@
     <v-text-field
       id="address-input"
       ref="address"
-      :value="address"
+      v-model="address"
       :error-messages="errorMessages"
       :rules="isAddressValid"
       :class="{
@@ -243,10 +243,10 @@ export default class AddressInput extends Mixins(BlockieMixin) {
 
         if (error) {
           this.errorMessages.push(error);
+        } else {
+          this.address = value;
         }
-
-        this.address = value;
-        this.input(this.address);
+        this.input(value);
         this.checkForErrors();
       });
   }
@@ -317,8 +317,9 @@ export default class AddressInput extends Mixins(BlockieMixin) {
 </script>
 
 <style lang="scss" scoped>
-@import '../main';
+@import '../scss/mixins';
 @import '../scss/colors';
+@import '../scss/fonts';
 
 .address-input {
   display: flex;
@@ -363,7 +364,7 @@ export default class AddressInput extends Mixins(BlockieMixin) {
     input {
       color: $color-white;
       caret-color: $color-white !important;
-      font-family: Roboto, sans-serif;
+      font-family: $main-font;
       font-size: 16px;
       max-height: 49px;
 
@@ -415,7 +416,7 @@ export default class AddressInput extends Mixins(BlockieMixin) {
 
     .v-messages {
       color: #323232 !important;
-      font-family: Roboto, sans-serif;
+      font-family: $main-font;
       font-size: 14px;
       line-height: 21px;
       text-align: left;
@@ -428,6 +429,14 @@ export default class AddressInput extends Mixins(BlockieMixin) {
         align-items: flex-start;
         padding-left: 20px;
         justify-content: center;
+
+        @include respond-to(handhelds) {
+          padding-left: 10px;
+        }
+      }
+
+      &__message {
+        line-height: 1.1;
       }
     }
   }

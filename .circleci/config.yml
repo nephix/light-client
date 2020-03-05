@@ -147,7 +147,7 @@ jobs:
     working_directory: *dapp_working_dir
     steps:
       - attach_workspace: *attach_options
-      - run: npm run build
+      - run: npm run build -- --mode ghpages
       - persist_to_workspace:
           root: ~/src
           paths:
@@ -218,20 +218,6 @@ workflows:
           requires:
             - lint_dapp
             - build_dapp
-      - generate_documentation:
-          requires:
-            - test_dapp
-          filters:
-            branches:
-              only:
-                - master
-      - deploy_gh_pages:
-          requires:
-            - generate_documentation
-          filters:
-            branches:
-              only:
-                - master
 
   publish:
     jobs:
@@ -243,9 +229,29 @@ workflows:
             - checkout
           filters:
             <<: *filter-version-regex
+      - install_dapp:
+          requires:
+            - install_sdk
+          filters:
+            <<: *filter-version-regex
+      - build_dapp:
+          requires:
+            - install_dapp
+          filters:
+            <<: *filter-version-regex
+      - generate_documentation:
+          requires:
+            - build_dapp
+          filters:
+            <<: *filter-version-regex
+      - deploy_gh_pages:
+          requires:
+            - generate_documentation
+          filters:
+            <<: *filter-version-regex
       - publish_artifact:
           context: "Raiden Context"
           requires:
-            - install_sdk
+            - deploy_gh_pages
           filters:
             <<: *filter-version-regex

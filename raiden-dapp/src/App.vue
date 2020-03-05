@@ -3,7 +3,8 @@
     <splash-screen
       v-if="inaccessible"
       :connecting="connecting"
-      @connect="connect()"
+      :connecting-subkey="connectingSubkey"
+      @connect="connect"
     ></splash-screen>
     <div v-else id="application-wrapper">
       <div id="application-content">
@@ -15,6 +16,10 @@
         </v-content>
       </div>
     </div>
+    <ul v-if="version" class="raiden-versions">
+      <li>{{ $t('versions.sdk', { version }) }}</li>
+      <li>{{ $t('versions.contracts', { version: contractVersion }) }}</li>
+    </ul>
     <div class="policy">
       <a href="https://raiden.network/privacy.html" target="_blank">
         {{ $t('application.privacy-policy') }}
@@ -27,11 +32,13 @@
 
 <script lang="ts">
 import { Component, Vue } from 'vue-property-decorator';
+import { mapState } from 'vuex';
+import { Raiden } from 'raiden-ts';
+
 import SplashScreen from '@/components/SplashScreen.vue';
 import AppHeader from '@/components/AppHeader.vue';
 import OfflineSnackbar from '@/components/OfflineSnackbar.vue';
 import UpdateSnackbar from '@/components/UpdateSnackbar.vue';
-import { mapState } from 'vuex';
 import { DeniedReason } from '@/model/types';
 
 @Component({
@@ -41,6 +48,7 @@ import { DeniedReason } from '@/model/types';
 export default class App extends Vue {
   name: string;
   connecting: boolean = false;
+  connectingSubkey: boolean = false;
   accessDenied!: DeniedReason;
   loading!: boolean;
 
@@ -57,10 +65,24 @@ export default class App extends Vue {
     );
   }
 
-  async connect() {
-    this.connecting = true;
+  get version() {
+    return Raiden.version;
+  }
+
+  get contractVersion() {
+    return Raiden.contractVersion;
+  }
+
+  async connect(subkey?: true) {
+    if (subkey) {
+      this.connectingSubkey = true;
+    } else {
+      this.connecting = true;
+    }
+
     this.$store.commit('reset');
-    await this.$raiden.connect();
+    await this.$raiden.connect(subkey);
+    this.connectingSubkey = false;
     this.connecting = false;
   }
 
@@ -71,16 +93,14 @@ export default class App extends Vue {
 </script>
 
 <style lang="scss" scoped>
-@import 'main';
+@import 'scss/mixins';
 @import 'scss/colors';
+
 #application-wrapper {
   height: 100%;
   display: flex;
   align-items: center;
   justify-content: center;
-  @include respond-to(handhelds) {
-    margin-top: 0;
-  }
 }
 
 #application-content {
@@ -113,19 +133,34 @@ export default class App extends Vue {
 
 .v-application {
   background: $background-gradient !important;
+
+  @include respond-to(handhelds) {
+    background: $card-background !important;
+  }
+}
+
+.raiden-versions {
+  font-size: 13px;
+  margin: 27px auto 6px auto;
+  color: $secondary-button-color;
+  list-style: none;
+  padding: 0;
+
+  li {
+    display: inline-block;
+
+    &:not(:last-child) {
+      margin-right: 15px;
+    }
+  }
 }
 
 .policy {
   font-size: 13px;
-  line-height: 15px;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  width: 220px;
-  margin: 27px auto 27px auto;
+  margin: 0 auto 27px auto;
 
   a {
-    color: #646464;
+    color: $secondary-text-color;
     text-decoration: none;
   }
 }

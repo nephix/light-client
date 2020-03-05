@@ -1,7 +1,15 @@
+import { promises as fs } from 'fs';
+import path from 'path';
+
 import { bigNumberify } from 'ethers/utils';
 
 import { ChannelState } from 'raiden-ts/channels';
-import { decodeRaidenState, encodeRaidenState, RaidenState } from 'raiden-ts/state';
+import {
+  decodeRaidenState,
+  encodeRaidenState,
+  RaidenState,
+  CURRENT_STATE_VERSION,
+} from 'raiden-ts/state';
 import { Address, UInt } from 'raiden-ts/utils/types';
 import { makeDefaultConfig } from 'raiden-ts/config';
 
@@ -16,6 +24,7 @@ describe('RaidenState codecs', () => {
   test('encodeRaidenState', () => {
     const state: RaidenState = {
       address,
+      version: CURRENT_STATE_VERSION,
       chainId,
       registry,
       blockNumber: 123,
@@ -35,13 +44,13 @@ describe('RaidenState codecs', () => {
       },
       tokens: { [token]: tokenNetwork },
       transport: {},
-      secrets: {},
       sent: {},
       path: { iou: {} },
       pendingTxs: [],
     };
     expect(JSON.parse(encodeRaidenState(state))).toEqual({
       address,
+      version: CURRENT_STATE_VERSION,
       chainId,
       registry,
       blockNumber: 123,
@@ -61,7 +70,6 @@ describe('RaidenState codecs', () => {
       },
       tokens: { [token]: tokenNetwork },
       transport: {},
-      secrets: {},
       sent: {},
       path: { iou: {} },
       pendingTxs: [],
@@ -70,10 +78,10 @@ describe('RaidenState codecs', () => {
 
   test('decodeRaidenState', () => {
     // missing required properties
-    expect(() => decodeRaidenState({ address })).toThrow('Invalid value undefined');
+    expect(() => decodeRaidenState({ address })).toThrow();
 
     // property of wrong type
-    expect(() => decodeRaidenState({ address: 123 })).toThrow('Invalid value 123');
+    expect(() => decodeRaidenState({ address: 123 })).toThrow();
 
     // invalid deep enum value and BigNumber
     expect(() =>
@@ -94,7 +102,6 @@ describe('RaidenState codecs', () => {
         },
         tokens: {},
         transport: {},
-        secrets: {},
         sent: {},
         path: { iou: {} },
         pendingTxs: [],
@@ -105,6 +112,7 @@ describe('RaidenState codecs', () => {
     expect(
       decodeRaidenState({
         address,
+        // no version, expect migration to add it
         chainId,
         registry,
         blockNumber: 123,
@@ -124,13 +132,13 @@ describe('RaidenState codecs', () => {
         },
         tokens: { [token]: tokenNetwork },
         transport: {},
-        secrets: {},
         sent: {},
         path: { iou: {} },
         pendingTxs: [],
       }),
     ).toEqual({
       address,
+      version: CURRENT_STATE_VERSION,
       chainId,
       registry,
       blockNumber: 123,
@@ -150,10 +158,22 @@ describe('RaidenState codecs', () => {
       },
       tokens: { [token]: tokenNetwork },
       transport: {},
-      secrets: {},
       sent: {},
       path: { iou: {} },
       pendingTxs: [],
     });
   });
+});
+
+test('migrations', async () => {
+  // iterate over past stored JSON states & ensure they can be migrated to current
+  const dir = path.join(path.dirname(await fs.realpath(__filename)), 'states');
+  const states = await fs.readdir(dir);
+  for (const file of states) {
+    if (!file.toLowerCase().endsWith('json')) continue;
+    const json = await fs.readFile(path.join(dir, file), { encoding: 'utf-8' });
+    console.info('decoding', file);
+    const decoded = decodeRaidenState(json);
+    expect(RaidenState.is(decoded)).toBe(true);
+  }
 });

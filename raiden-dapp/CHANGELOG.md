@@ -1,14 +1,49 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.2] - 2020-03-05
+### Fixed
+- [#1139] Fix AddressInput value resetting when validation fails
+
+[#1139]: https://github.com/raiden-network/light-client/issues/1139
+
+## [0.4.1] - 2020-03-04
+### Fixed
+- [#1116] Fixed unhandled exception on transfer error dialog on PFS expected errors
+- [#1118] Fixed token list in token overlay.
+- [#1115] Fixed error message when trying to connect to main net.
+- [#1078] Various mobile UI improvements.
+
+[#1078]: https://github.com/raiden-network/light-client/issues/1078
+[#1118]: https://github.com/raiden-network/light-client/issues/1118
+[#1115]: https://github.com/raiden-network/light-client/issues/1115
+[#1116]: https://github.com/raiden-network/light-client/issues/1116
+
+## [0.4.0] - 2020-02-28
 ### Added
+- [#745] Possibility to connect LC with derived subkey
+- [#1015] More prominent warning for low UDC token balance
 - [#695] Skipping of transfer steps.
+- [#1071] Mint token feature.
+- [#1112] Implement log storage across sessions
 
 ### Changed
+- [#693] Localized error messages for Pathfinding errors.
 
 ### Fixed
+- [#1065] Prevent select hub dialog from being accidentally dismissed.
+- [#1067] Fixed displayed service fee on summary screen.
+- [#1066] Fixed continue button enabled w/o selected PFS.
 
+
+[#1112]: https://github.com/raiden-network/light-client/issues/1112
+[#1066]: https://github.com/raiden-network/light-client/issues/1066
+[#745]: https://github.com/raiden-network/light-client/issues/745
+[#1065]: https://github.com/raiden-network/light-client/issues/1065
+[#1067]: https://github.com/raiden-network/light-client/issues/1067
+[#1071]: https://github.com/raiden-network/light-client/issues/1071
+[#1015]: https://github.com/raiden-network/light-client/issues/1015
 [#695]: https://github.com/raiden-network/light-client/issues/695
+[#693]: https://github.com/raiden-network/light-client/issues/693
 
 
 ## [0.3.0] - 2020-02-07
@@ -110,7 +145,9 @@
 - Add link to privacy policy.
 - Add basic transfer screen.
 
-[Unreleased]: https://github.com/raiden-network/light-client/compare/v0.3.0...HEAD
+[0.4.2]: https://github.com/raiden-network/light-client/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/raiden-network/light-client/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/raiden-network/light-client/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/raiden-network/light-client/compare/v0.2...v0.3.0
 [0.2]: https://github.com/raiden-network/light-client/compare/v0.1.1...v0.2
 [0.1.1]: https://github.com/raiden-network/light-client/compare/v0.1...v0.1.1

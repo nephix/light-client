@@ -1,18 +1,29 @@
 import { Signer, Wallet, Contract } from 'ethers';
+import { ContractReceipt, ContractTransaction } from 'ethers/contract';
 import { Network, toUtf8Bytes, sha256 } from 'ethers/utils';
 import { JsonRpcProvider } from 'ethers/providers';
-import { Observable, from } from 'rxjs';
-import { filter, map, scan, concatMap, pluck } from 'rxjs/operators';
+import { Observable, from, defer } from 'rxjs';
+import {
+  filter,
+  map,
+  scan,
+  concatMap,
+  pluck,
+  withLatestFrom,
+  first,
+  exhaustMap,
+} from 'rxjs/operators';
 import { findKey, transform, pick } from 'lodash';
+import logging from 'loglevel';
 
 import { RaidenState } from './state';
 import { ContractsInfo, RaidenEpicDeps } from './types';
 import { raidenSentTransfer } from './transfers/utils';
-import { SentTransfer, SentTransfers, RaidenSentTransfer } from './transfers/state';
+import { TransferState, TransfersState, RaidenTransfer } from './transfers/state';
 import { channelAmounts } from './channels/utils';
 import { RaidenChannels, RaidenChannel, Channel } from './channels/state';
 import { pluckDistinct } from './utils/rx';
-import { Address, PrivateKey, isntNil, Hash } from './utils/types';
+import { Address, PrivateKey, isntNil, Hash, assert } from './utils/types';
 import { getNetworkName } from './utils/ethers';
 
 import ropstenDeploy from './deployment/deployment_ropsten.json';
@@ -21,6 +32,7 @@ import goerliDeploy from './deployment/deployment_goerli.json';
 import ropstenServicesDeploy from './deployment/deployment_services_ropsten.json';
 import rinkebyServicesDeploy from './deployment/deployment_services_rinkeby.json';
 import goerliServicesDeploy from './deployment/deployment_services_goerli.json';
+import { RaidenError, ErrorCodes } from './utils/error';
 
 /**
  * Returns contract information depending on the passed [[Network]]. Currently, only
@@ -48,9 +60,7 @@ export const getContracts = (network: Network): ContractsInfo => {
         ...goerliServicesDeploy.contracts,
       } as unknown) as ContractsInfo;
     default:
-      throw new Error(
-        `No deploy info provided nor recognized network: ${JSON.stringify(network)}`,
-      );
+      throw new RaidenError(ErrorCodes.RDN_UNRECOGNIZED_NETWORK, { network: network.name });
   }
 };
 
@@ -102,7 +112,10 @@ export const getSigner = async (
     } else if (account instanceof Wallet) {
       signer = account.connect(provider);
     } else {
-      throw new Error(`Signer ${account} not connected to ${provider}`);
+      throw new RaidenError(ErrorCodes.RDN_SIGNER_NOT_CONNECTED, {
+        account: account.toString(),
+        provider: provider.toString(),
+      });
     }
     address = (await signer.getAddress()) as Address;
   } else if (typeof account === 'number') {
@@ -113,7 +126,10 @@ export const getSigner = async (
     // address
     const accounts = await provider.listAccounts();
     if (!accounts.includes(account)) {
-      throw new Error(`Account "${account}" not found in provider, got=${accounts}`);
+      throw new RaidenError(ErrorCodes.RDN_ACCOUNT_NOT_FOUND, {
+        account,
+        accounts: JSON.stringify(accounts),
+      });
     }
     signer = provider.getSigner(account);
     address = account;
@@ -122,7 +138,7 @@ export const getSigner = async (
     signer = new Wallet(account, provider);
     address = signer.address as Address;
   } else {
-    throw new Error('String account must be either a 0x-encoded address or private key');
+    throw new RaidenError(ErrorCodes.RDN_STRING_ACCOUNT_INVALID);
   }
 
   if (subkey) {
@@ -139,13 +155,13 @@ export const getSigner = async (
  * @param state$ - Observable of the current RaidenState
  * @returns observable of sent and completed Raiden transfers
  */
-export const initTransfers$ = (state$: Observable<RaidenState>): Observable<RaidenSentTransfer> =>
+export const initTransfers$ = (state$: Observable<RaidenState>): Observable<RaidenTransfer> =>
   state$.pipe(
     pluckDistinct('sent'),
     concatMap(sent => from(Object.entries(sent))),
     /* this scan stores a reference to each [key,value] in 'acc', and emit as 'changed' iff it
      * changes from last time seen. It relies on value references changing only if needed */
-    scan<[string, SentTransfer], { acc: SentTransfers; changed?: SentTransfer }>(
+    scan<[string, TransferState], { acc: TransfersState; changed?: TransferState }>(
       ({ acc }, [secrethash, sent]) =>
         // if ref didn't change, emit previous accumulator, without 'changed' value
         acc[secrethash] === sent
@@ -156,7 +172,7 @@ export const initTransfers$ = (state$: Observable<RaidenState>): Observable<Raid
     ),
     pluck('changed'),
     filter(isntNil), // filter out if reference didn't change from last emit
-    // from here, we get SentTransfer objects which changed from previous state (all on first)
+    // from here, we get TransferState objects which changed from previous state (all on first)
     map(raidenSentTransfer),
   );
 
@@ -250,4 +266,91 @@ export function chooseOnchainAccount(
 export function getContractWithSigner<C extends Contract>(contract: C, signer: Signer): C {
   if (contract.signer === signer) return contract;
   return contract.connect(signer) as C;
+}
+
+/**
+ * Calls a contract method and wait for it to be mined successfuly, rejects otherwise
+ *
+ * @param contract - Contract instance
+ * @param method - Method name
+ * @param params - Params tuple to method
+ * @param errorCode - ErrorCode to throw in case of failure
+ * @returns Promise to successful receipt
+ */
+export async function callAndWaitMined<
+  C extends Contract,
+  M extends keyof C['functions'],
+  P extends Parameters<C['functions'][M]>
+>(
+  contract: C,
+  method: M,
+  params: P,
+  errorCode: ErrorCodes,
+  { log }: { log: logging.Logger } = { log: logging },
+): Promise<ContractReceipt> {
+  let tx: ContractTransaction;
+  try {
+    // 'as C' just to avoid error with unknown functions Bucket
+    tx = await (contract.functions as C)[method](...params);
+  } catch (err) {
+    log.error(`Error sending ${method} tx`, err);
+    throw new RaidenError(errorCode, { error: err.message });
+  }
+  log.debug(`sent ${method} tx "${tx.hash}" to "${contract.address}"`);
+
+  let receipt: ContractReceipt;
+  try {
+    receipt = await tx.wait();
+    assert(receipt.status, `tx status: ${receipt.status}`);
+  } catch (err) {
+    log.error(`Error mining ${method} tx`, err);
+    throw new RaidenError(errorCode, {
+      transactionHash: tx.hash!,
+    });
+  }
+  log.debug(`${method} tx "${tx.hash}" successfuly mined!`);
+  return receipt;
+}
+
+/**
+ * Waits for a given receipt to be confirmed; throws if it gets removed by a reorg instead
+ *
+ * @param receipt - Receipt to wait for confirmation
+ * @param deps - RaidenEpicDeps
+ * @param confBlocks - Overwrites config
+ * @returns Promise final block of transaction
+ */
+export async function waitConfirmation(
+  receipt: ContractReceipt,
+  { latest$, config$, provider }: RaidenEpicDeps,
+  confBlocks?: number,
+): Promise<number> {
+  const txBlock = receipt.blockNumber!;
+  const txHash = receipt.transactionHash!;
+  return latest$
+    .pipe(
+      pluckDistinct('state', 'blockNumber'),
+      withLatestFrom(config$),
+      filter(
+        ([blockNumber, { confirmationBlocks }]) =>
+          txBlock + (confBlocks ?? confirmationBlocks) <= blockNumber,
+      ),
+      exhaustMap(([blockNumber, { confirmationBlocks }]) =>
+        defer(() => provider.getTransactionReceipt(txHash)).pipe(
+          map(receipt => {
+            if (
+              receipt?.confirmations &&
+              receipt.confirmations >= (confBlocks ?? confirmationBlocks)
+            )
+              return receipt.blockNumber;
+            else if (txBlock + 2 * (confBlocks ?? confirmationBlocks) < blockNumber)
+              throw new RaidenError(ErrorCodes.RDN_TRANSACTION_REORG, {
+                transactionHash: txHash,
+              });
+          }),
+        ),
+      ),
+      first(isntNil),
+    )
+    .toPromise();
 }

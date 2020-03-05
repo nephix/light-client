@@ -8,10 +8,14 @@ Vue.use(Vuetify);
 
 describe('SplashScreen.vue', () => {
   let wrapper: Wrapper<Loading>;
+  let vuetify: typeof Vuetify;
 
   beforeEach(() => {
+    vuetify = new Vuetify();
     wrapper = mount(Loading, {
+      vuetify,
       store,
+      stubs: ['i18n'],
       propsData: {
         connecting: false
       },
@@ -21,7 +25,7 @@ describe('SplashScreen.vue', () => {
     });
   });
 
-  test('show the Raiden dApp name', () => {
-    expect(wrapper.vm.$data.name).toEqual('Raiden dApp');
+  test('show Raiden dApp welcome message', () => {
+    expect(wrapper.vm.$data.welcome).toEqual('Welcome to the Raiden dApp');
   });
 });

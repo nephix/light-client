@@ -31,7 +31,7 @@
       </v-row>
 
       <v-row>
-        <v-col cols="2" align-self="center"></v-col>
+        <v-col cols="2" class="hidden-sm-and-down" align-self="center"></v-col>
         <v-col
           cols="10"
           align-self="center"
@@ -42,7 +42,7 @@
       </v-row>
 
       <v-row class="token-list">
-        <v-col cols="12" class="fill-height">
+        <v-col cols="12">
           <v-list
             v-for="(token, i) in tokens"
             :key="i"
@@ -142,6 +142,8 @@ export default class TokenOverlay extends Mixins(
 <style lang="scss" scoped>
 @import '../scss/colors';
 @import '../scss/scroll';
+@import '../scss/fonts';
+@import '../scss/mixins';
 
 .token-network-overlay {
   border-bottom-left-radius: 10px;
@@ -168,6 +170,10 @@ export default class TokenOverlay extends Mixins(
 
     .v-list-item {
       padding: 0 0 0 48px;
+
+      @include respond-to(handhelds) {
+        padding: 0;
+      }
     }
   }
 
@@ -189,7 +195,6 @@ export default class TokenOverlay extends Mixins(
       overflow-y: auto;
       @extend .themed-scrollbar;
 
-      height: 100%;
       background-color: transparent !important;
       padding-bottom: 0;
       padding-top: 0;
@@ -209,7 +214,7 @@ export default class TokenOverlay extends Mixins(
 
     &__token-balance {
       color: $color-white;
-      font-family: Roboto, sans-serif;
+      font-family: $main-font;
       font-size: 16px;
       font-weight: bold;
       line-height: 20px;

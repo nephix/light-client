@@ -12,6 +12,7 @@ import { createLogger } from 'redux-logger';
 import { constant, memoize } from 'lodash';
 import { Observable, AsyncSubject, merge, defer, EMPTY, ReplaySubject, of } from 'rxjs';
 import { first, filter, map, mergeMap, skip } from 'rxjs/operators';
+import logging from 'loglevel';
 
 import { TokenNetworkRegistryFactory } from './contracts/TokenNetworkRegistryFactory';
 import { TokenNetworkFactory } from './contracts/TokenNetworkFactory';
@@ -19,13 +20,15 @@ import { HumanStandardTokenFactory } from './contracts/HumanStandardTokenFactory
 import { ServiceRegistryFactory } from './contracts/ServiceRegistryFactory';
 import { CustomTokenFactory } from './contracts/CustomTokenFactory';
 import { UserDepositFactory } from './contracts/UserDepositFactory';
+import { SecretRegistryFactory } from './contracts/SecretRegistryFactory';
 
+import versions from './versions.json';
 import { ContractsInfo, EventTypes, OnChange, RaidenEpicDeps } from './types';
 import { ShutdownReason } from './constants';
 import { RaidenState, getState } from './state';
 import { RaidenConfig, makeDefaultConfig, PartialRaidenConfig } from './config';
-import { RaidenChannels } from './channels/state';
-import { RaidenSentTransfer } from './transfers/state';
+import { RaidenChannels, ChannelState } from './channels/state';
+import { RaidenTransfer } from './transfers/state';
 import { raidenReducer } from './reducer';
 import { raidenRootEpic } from './epics';
 import {
@@ -44,7 +47,7 @@ import {
 } from './channels/actions';
 import { matrixPresence } from './transport/actions';
 import { transfer, transferSigned } from './transfers/actions';
-import { makeSecret, getSecrethash, makePaymentId } from './transfers/utils';
+import { makeSecret, getSecrethash, makePaymentId, raidenSentTransfer } from './transfers/utils';
 import { pathFind } from './path/actions';
 import { Paths, RaidenPaths, PFS, RaidenPFS, IOU } from './path/types';
 import { pfsListInfo } from './path/utils';
@@ -59,7 +62,10 @@ import {
   mapTokenToPartner,
   chooseOnchainAccount,
   getContractWithSigner,
+  waitConfirmation,
+  callAndWaitMined,
 } from './helpers';
+import { RaidenError, ErrorCodes } from './utils/error';
 
 export class Raiden {
   private readonly store: Store<RaidenState, RaidenAction>;
@@ -93,7 +99,7 @@ export class Raiden {
    * Every time a transfer state is updated, it's emitted here. 'secrethash' property is unique and
    * may be used as identifier to know which transfer got updated.
    */
-  public readonly transfers$: Observable<RaidenSentTransfer>;
+  public readonly transfers$: Observable<RaidenTransfer>;
 
   /**
    * Expose ether's Provider.resolveName for ENS support
@@ -145,6 +151,7 @@ export class Raiden {
   ) {
     this.resolveName = provider.resolveName.bind(provider) as (name: string) => Promise<Address>;
     const address = state.address;
+    const log = logging.getLogger(`raiden:${address}`);
 
     // use next from latest known blockNumber as start block when polling
     provider.resetEventsBlock(state.blockNumber + 1);
@@ -182,6 +189,7 @@ export class Raiden {
       network,
       signer,
       address,
+      log,
       contractsInfo,
       registryContract: TokenNetworkRegistryFactory.connect(
         contractsInfo.TokenNetworkRegistry.address,
@@ -201,6 +209,10 @@ export class Raiden {
         contractsInfo.UserDeposit.address,
         main?.signer ?? signer,
       ),
+      secretRegistryContract: SecretRegistryFactory.connect(
+        contractsInfo.SecretRegistry.address,
+        main?.signer ?? signer,
+      ),
       main,
     };
 
@@ -209,28 +221,19 @@ export class Raiden {
     );
 
     const loggerMiddleware = createLogger({
-      predicate: () =>
-        this.config.logger !== '' &&
-        (this.config.logger !== undefined || process.env.NODE_ENV === 'development'),
+      predicate: () => this.log.getLevel() <= logging.levels.INFO,
+      logger: log,
       level: {
-        prevState: () =>
-          typeof this.config.logger === 'object'
-            ? this.config.logger['prevState'] ?? ''
-            : this.config.logger ?? 'debug',
-        action: () =>
-          typeof this.config.logger === 'object'
-            ? this.config.logger['action'] ?? ''
-            : this.config.logger ?? 'debug',
-        error: () =>
-          typeof this.config.logger === 'object'
-            ? this.config.logger['error'] ?? ''
-            : this.config.logger ?? 'debug',
-        nextState: () =>
-          typeof this.config.logger === 'object'
-            ? this.config.logger['nextState'] ?? ''
-            : this.config.logger ?? 'debug',
+        prevState: 'debug',
+        action: 'info',
+        error: 'error',
+        nextState: 'debug',
       },
     });
+
+    this.deps.config$
+      .pipe(pluckDistinct('logger'))
+      .subscribe(logger => this.log.setLevel(logger || 'silent', false));
 
     // minimum blockNumber of contracts deployment as start scan block
     this.epicMiddleware = createEpicMiddleware<
@@ -268,9 +271,9 @@ export class Raiden {
    *       <li>number index of a remote account loaded in provider
    *            (e.g. 0 for Metamask's loaded account)</li>
    *     </ul>
-   * @param storageOrState - Storage/localStorage-like synchronous object where to load and store
-   *     current state or initial RaidenState-like object instead. In this case, user must listen
-   *     state$ changes and update them on whichever persistency option is used
+   * @param storageOrState - Storage/localStorage-like object from where to load and store current
+   *     state, initial RaidenState-like object, or a { storage; state? } object containing both.
+   *     If a storage isn't provided, user must listen state$ changes on ensure it's persisted.
    * @param contracts - Contracts deployment info
    * @param config - Raiden configuration
    * @param subkey - Whether to use a derived subkey or not
@@ -279,7 +282,11 @@ export class Raiden {
   public static async create(
     connection: JsonRpcProvider | AsyncSendable | string,
     account: Signer | string | number,
-    storageOrState?: Storage | RaidenState | unknown,
+    storageOrState?:
+      | Storage
+      | RaidenState
+      | { storage: Storage; state?: RaidenState | unknown }
+      | unknown,
     contracts?: ContractsInfo,
     config?: PartialRaidenConfig,
     subkey?: true,
@@ -340,7 +347,7 @@ export class Raiden {
     // prevent start from being called again, turns this.started to true
     this.epicMiddleware = undefined;
     // dispatch a first, noop action, to next first state$ as current/initial state
-    this.store.dispatch(raidenConfigUpdate({ config: {} }));
+    this.store.dispatch(raidenConfigUpdate({}));
   }
 
   /**
@@ -363,7 +370,12 @@ export class Raiden {
     this.store.dispatch(raidenShutdown({ reason: ShutdownReason.STOP }));
   }
 
-  private get state(): RaidenState {
+  /**
+   * Get current RaidenState object. Can be serialized safely with [[encodeRaidenState]]
+   *
+   * @returns Current Raiden state
+   */
+  public get state(): RaidenState {
     return this.store.getState();
   }
 
@@ -374,6 +386,15 @@ export class Raiden {
    */
   public get address(): Address {
     return this.deps.address;
+  }
+
+  /**
+   * Instance's Logger, compatible with console's API
+   *
+   * @returns Logger instance
+   */
+  private get log(): logging.Logger {
+    return this.deps.log;
   }
 
   /**
@@ -417,12 +438,30 @@ export class Raiden {
   }
 
   /**
+   * Returns the currently used SDK version.
+   *
+   * @returns SDK version
+   */
+  static get version(): string {
+    return versions.sdk;
+  }
+
+  /**
+   * Returns the version of the used Smart Contracts.
+   *
+   * @returns Smart Contract version
+   */
+  static get contractVersion(): string {
+    return versions.contracts;
+  }
+
+  /**
    * Update Raiden Config with a partial (shallow) object
    *
    * @param config - Partial object containing keys and values to update in config
    */
   public updateConfig(config: PartialRaidenConfig) {
-    this.store.dispatch(raidenConfigUpdate({ config }));
+    this.store.dispatch(raidenConfigUpdate(config));
   }
 
   /**
@@ -508,24 +547,47 @@ export class Raiden {
    * @param options - (optional) option parameter
    * @param options.settleTimeout - Custom, one-time settle timeout
    * @param options.subkey - Whether to use the subkey for on-chain tx or main account (default)
+   * @param onChange - Optional callback for status change notification
    * @returns txHash of channelOpen call, iff it succeeded
    */
   public async openChannel(
     token: string,
     partner: string,
-    options: { settleTimeout?: number; subkey?: boolean } = {},
+    options: { settleTimeout?: number; subkey?: boolean; deposit?: BigNumberish } = {},
+    onChange?: OnChange<EventTypes, { txHash: string }>,
   ): Promise<Hash> {
     assert(Address.is(token) && Address.is(partner), 'Invalid address');
     const tokenNetwork = await this.monitorToken(token);
     assert(!options.subkey || this.deps.main, "Can't send tx from subkey if not set");
+    const deposit = options.deposit === undefined ? undefined : decode(UInt(32), options.deposit);
 
     const meta = { tokenNetwork, partner };
     // wait for confirmation
-    const promise = asyncActionToPromise(channelOpen, meta, this.action$, true).then(
+    const openPromise = asyncActionToPromise(channelOpen, meta, this.action$, false).then(
       ({ txHash }) => txHash, // pluck txHash
     );
-    this.store.dispatch(channelOpen.request(options, meta));
-    return promise;
+
+    this.store.dispatch(channelOpen.request({ ...options, deposit }, meta));
+
+    const openTxHash = await openPromise;
+    onChange?.({ type: EventTypes.OPENED, payload: { txHash: openTxHash } });
+
+    await this.state$
+      .pipe(
+        pluckDistinct('channels', tokenNetwork, partner, 'state'),
+        first(state => state === ChannelState.open),
+      )
+      .toPromise();
+    onChange?.({ type: EventTypes.CONFIRMED, payload: { txHash: openTxHash } });
+
+    if (deposit) {
+      const depositTx = await asyncActionToPromise(channelDeposit, meta, this.action$, true).then(
+        ({ txHash }) => txHash, // pluck txHash
+      );
+      onChange?.({ type: EventTypes.DEPOSITED, payload: { txHash: depositTx } });
+    }
+
+    return openTxHash;
   }
 
   /**
@@ -766,6 +828,32 @@ export class Raiden {
   }
 
   /**
+   * Waits for the transfer identified by a secrethash to fail or complete
+   *
+   * The returned promise will resolve with the final amount received by the target
+   *
+   * @param secrethash - Transfer identifier
+   * @returns Amount received by target, as informed by them on SecretRequest
+   */
+  public async waitTransfer(secrethash: string): Promise<BigNumber | undefined> {
+    assert(Hash.is(secrethash), 'Invalid secrethash for transfer');
+    let state = this.state;
+    assert(secrethash in state.sent, 'Unknown secrethash');
+
+    const sent = raidenSentTransfer(state.sent[secrethash]);
+    // already completed/past transfer
+    if (sent.completed) {
+      if (sent.success) return this.state.sent[secrethash].secretRequest?.[1]?.amount;
+      else throw new RaidenError(ErrorCodes.XFER_ALREADY_COMPLETED, { status: sent.status });
+    }
+
+    // throws/rejects if a failure occurs
+    await asyncActionToPromise(transfer, { secrethash }, this.action$);
+    state = this.state;
+    return state.sent[secrethash].secretRequest?.[1]?.amount;
+  }
+
+  /**
    * Request a path from PFS
    *
    * If a direct route is possible, it'll be returned. Else if PFS is set up, a request will be
@@ -885,11 +973,18 @@ export class Raiden {
     const { signer } = chooseOnchainAccount(this.deps, subkey ?? this.config.subkey);
     // Mint token
     const customTokenContract = CustomTokenFactory.connect(token, signer);
-    const tx = await customTokenContract.functions.mint(decode(UInt(32), amount));
-    const receipt = await tx.wait();
-    if (!receipt.status) throw new Error('Failed to mint token.');
 
-    return tx.hash as Hash;
+    const receipt = await callAndWaitMined(
+      customTokenContract,
+      'mint',
+      [decode(UInt(32), amount)],
+      ErrorCodes.RDN_MINT_FAILED,
+      { log: this.log },
+    );
+
+    // wait for a single block, so future calls will correctly pick value
+    await waitConfirmation(receipt, this.deps, 1);
+    return receipt.transactionHash as Hash;
   }
 
   /**
@@ -937,10 +1032,10 @@ export class Raiden {
     onChange?: OnChange<EventTypes, { txHash: string }>,
     { subkey }: { subkey?: boolean } = {},
   ): Promise<Hash> {
-    assert(!subkey || this.deps.main, "Can't send tx from subkey if not set");
+    assert(!subkey || this.deps.main, "Can't send tx from subkey if not set", this.log.debug);
 
     const depositAmount = bigNumberify(amount);
-    assert(depositAmount.gt(Zero), 'Please deposit a positive amount.');
+    assert(depositAmount.gt(Zero), 'Please deposit a positive amount.', this.log.debug);
 
     const { signer, address } = chooseOnchainAccount(this.deps, subkey ?? this.config.subkey);
 
@@ -951,38 +1046,51 @@ export class Raiden {
     );
     const balance = await serviceTokenContract.functions.balanceOf(address);
 
-    assert(balance.gte(amount), `Insufficient token balance (${balance}).`);
+    assert(balance.gte(amount), `Insufficient token balance (${balance}).`, this.log.debug);
 
-    const approveTx = await serviceTokenContract.functions.approve(
-      userDepositContract.address,
-      depositAmount,
+    const approveReceipt = await callAndWaitMined(
+      serviceTokenContract,
+      'approve',
+      [userDepositContract.address, depositAmount],
+      ErrorCodes.RDN_APPROVE_TRANSACTION_FAILED,
+      { log: this.log },
     );
-    const approveReceipt = await approveTx.wait();
-    if (!approveReceipt.status) throw new Error('Approve transaction failed.');
 
     onChange?.({
       type: EventTypes.APPROVED,
       payload: {
-        txHash: approveTx.hash as Hash,
+        txHash: approveReceipt.transactionHash as Hash,
       },
     });
 
     const currentUDCBalance = await userDepositContract.functions.balances(this.address);
-    const depositTx = await userDepositContract.functions.deposit(
-      this.address,
-      currentUDCBalance.add(depositAmount),
+
+    const depositReceipt = await callAndWaitMined(
+      userDepositContract,
+      'deposit',
+      [this.address, currentUDCBalance.add(depositAmount)],
+      ErrorCodes.RDN_DEPOSIT_TRANSACTION_FAILED,
+      { log: this.log },
     );
-    const depositReceipt = await depositTx.wait();
-    if (!depositReceipt.status) throw new Error('Deposit transaction failed.');
 
     onChange?.({
       type: EventTypes.DEPOSITED,
       payload: {
-        txHash: depositTx.hash as Hash,
+        txHash: depositReceipt.transactionHash as Hash,
       },
     });
 
-    return depositTx.hash as Hash;
+    await waitConfirmation(depositReceipt, this.deps);
+    this.log.debug(`deposit tx "${depositReceipt.transactionHash}" confirmed`);
+
+    onChange?.({
+      type: EventTypes.CONFIRMED,
+      payload: {
+        txHash: depositReceipt.transactionHash as Hash,
+      },
+    });
+
+    return depositReceipt.transactionHash as Hash;
   }
 
   /**
@@ -1007,15 +1115,15 @@ export class Raiden {
     value: BigNumberish,
     { subkey }: { subkey?: boolean } = {},
   ): Promise<Hash> {
-    assert(Address.is(to), 'Invalid address');
-    assert(!subkey || this.deps.main, "Can't send tx from subkey if not set");
+    assert(Address.is(to), 'Invalid address', this.log.debug);
+    assert(!subkey || this.deps.main, "Can't send tx from subkey if not set", this.log.debug);
 
     const { signer } = chooseOnchainAccount(this.deps, subkey ?? this.config.subkey);
 
     const tx = await signer.sendTransaction({ to, value: bigNumberify(value) });
     const receipt = await tx.wait();
 
-    if (!receipt.status) throw new Error('Failed to transfer balance');
+    if (!receipt.status) throw new RaidenError(ErrorCodes.RDN_TRANSFER_ONCHAIN_BALANCE_FAILED);
     return tx.hash! as Hash;
   }
 
@@ -1038,17 +1146,20 @@ export class Raiden {
     value: BigNumberish,
     { subkey }: { subkey?: boolean } = {},
   ): Promise<Hash> {
-    assert(Address.is(token) && Address.is(to), 'Invalid address');
-    assert(!subkey || this.deps.main, "Can't send tx from subkey if not set");
+    assert(Address.is(token) && Address.is(to), 'Invalid address', this.log.debug);
+    assert(!subkey || this.deps.main, "Can't send tx from subkey if not set", this.log.debug);
 
     const { signer } = chooseOnchainAccount(this.deps, subkey ?? this.config.subkey);
     const tokenContract = getContractWithSigner(this.deps.getTokenContract(token), signer);
 
-    const tx = await tokenContract.functions.transfer(to, bigNumberify(value));
-    const receipt = await tx.wait();
-
-    if (!receipt.status) throw new Error('Failed to transfer tokens');
-    return tx.hash! as Hash;
+    const receipt = await callAndWaitMined(
+      tokenContract,
+      'transfer',
+      [to, bigNumberify(value)],
+      ErrorCodes.RDN_TRANSFER_ONCHAIN_TOKENS_FAILED,
+      { log: this.log },
+    );
+    return receipt.transactionHash as Hash;
   }
 }
 

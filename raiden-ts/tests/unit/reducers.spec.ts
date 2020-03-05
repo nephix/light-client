@@ -33,6 +33,8 @@ import {
   transferUnlockProcessed,
   transferExpireProcessed,
   withdrawReceive,
+  transferSecretRequest,
+  transferSecretRegistered,
 } from 'raiden-ts/transfers/actions';
 import {
   LockedTransfer,
@@ -43,6 +45,7 @@ import {
   SecretReveal,
   RefundTransfer,
   WithdrawConfirmation,
+  SecretRequest,
 } from 'raiden-ts/messages/types';
 import {
   makeMessageId,
@@ -51,6 +54,7 @@ import {
   getLocksroot,
 } from 'raiden-ts/transfers/utils';
 import { makeSignature } from './mocks';
+import { RaidenError, ErrorCodes } from 'raiden-ts/utils/error';
 
 describe('raidenReducer', () => {
   let state: RaidenState;
@@ -79,6 +83,8 @@ describe('raidenReducer', () => {
           ServiceRegistry: { address: AddressZero as Address, block_number: 0 },
           // eslint-disable-next-line @typescript-eslint/camelcase
           UserDeposit: { address: AddressZero as Address, block_number: 0 },
+          // eslint-disable-next-line @typescript-eslint/camelcase
+          SecretRegistry: { address: AddressZero as Address, block_number: 0 },
         },
       },
       { blockNumber: 1337 },
@@ -176,7 +182,7 @@ describe('raidenReducer', () => {
     });
 
     test('channelOpen.failure', () => {
-      const error = new Error('could not open channel');
+      const error = new RaidenError(ErrorCodes.CNL_OPENCHANNEL_FAILED);
       const newState = [
         channelOpen.request({ settleTimeout }, { tokenNetwork, partner }),
         channelOpen.failure(error, { tokenNetwork, partner }),
@@ -566,7 +572,10 @@ describe('raidenReducer', () => {
     test("channelClose.failure doesn't mutate state", () => {
       const newState = raidenReducer(
         state,
-        channelClose.failure(new Error('channelClose failed'), { tokenNetwork, partner }),
+        channelClose.failure(new RaidenError(ErrorCodes.CNL_CLOSECHANNEL_FAILED), {
+          tokenNetwork,
+          partner,
+        }),
       );
       expect(newState).toEqual(state);
     });
@@ -685,7 +694,7 @@ describe('raidenReducer', () => {
         channelSettleable({ settleableBlock: settleBlock }, { tokenNetwork, partner }),
         channelSettle.request(undefined, { tokenNetwork, partner }),
       ].reduce(raidenReducer, state);
-      const error = new Error('settle tx failed');
+      const error = new RaidenError(ErrorCodes.CNL_SETTLECHANNEL_FAILED);
       const newState2 = raidenReducer(
         newState,
         channelSettle.failure(error, { tokenNetwork, partner }),
@@ -911,29 +920,39 @@ describe('raidenReducer', () => {
 
     test('secret register', () => {
       // normal secret register without blockNumber
-      let newState = [transferSecret({ secret }, { secrethash })].reduce(raidenReducer, state);
-      expect(get(newState, ['secrets'])).toStrictEqual({ [secrethash]: { secret } });
+      let newState = [
+        transferSigned({ message: transfer, fee }, { secrethash }),
+        transferSecret({ secret }, { secrethash }),
+      ].reduce(raidenReducer, state);
+
+      expect(newState.sent[secrethash]?.secret).toStrictEqual([
+        expect.any(Number),
+        { value: secret, registerBlock: 0 },
+      ]);
 
       // with blockNumber saves it as well
-      newState = [transferSecret({ secret, registerBlock: 123 }, { secrethash })].reduce(
-        raidenReducer,
-        newState,
-      );
-      expect(get(newState, ['secrets'])).toStrictEqual({
-        [secrethash]: {
-          secret,
-          registerBlock: 123,
-        },
-      });
+      newState = [
+        transferSecretRegistered(
+          { secret, txHash, txBlock: 123, confirmed: true },
+          { secrethash },
+        ),
+      ].reduce(raidenReducer, newState);
+      expect(newState.sent[secrethash].secret).toStrictEqual([
+        expect.any(Number),
+        { value: secret, registerBlock: 123 },
+      ]);
 
       // if already registered with blockNumber and try without, keep the blockNumber
-      newState = [transferSecret({ secret }, { secrethash })].reduce(raidenReducer, newState);
-      expect(get(newState, ['secrets'])).toStrictEqual({
-        [secrethash]: {
-          secret,
-          registerBlock: 123,
-        },
-      });
+      newState = [
+        transferSecretRegistered(
+          { secret, txHash, txBlock: 123, confirmed: undefined },
+          { secrethash },
+        ),
+      ].reduce(raidenReducer, newState);
+      expect(newState.sent[secrethash].secret).toStrictEqual([
+        expect.any(Number),
+        { value: secret, registerBlock: 123 },
+      ]);
     });
 
     test('transfer signed', () => {
@@ -983,6 +1002,25 @@ describe('raidenReducer', () => {
       ].reduce(raidenReducer, state);
 
       expect(get(newState, ['sent', secrethash, 'transferProcessed', 1])).toBe(processed);
+    });
+
+    test('transfer secret request', () => {
+      const secretRequest: Signed<SecretRequest> = {
+          type: MessageType.SECRET_REQUEST,
+          message_identifier: makeMessageId(),
+          secrethash,
+          payment_identifier: transfer.payment_identifier,
+          amount: transfer.lock.amount,
+          expiration: transfer.lock.expiration,
+          signature: makeSignature(),
+        },
+        action = transferSecretRequest({ message: secretRequest }, { secrethash }),
+        newState = [transferSigned({ message: transfer, fee }, { secrethash }), action].reduce(
+          raidenReducer,
+          state,
+        );
+
+      expect(newState.sent[secrethash]?.secretRequest?.[1]).toBe(secretRequest);
     });
 
     test('transfer secret reveal', () => {
@@ -1151,8 +1189,8 @@ describe('raidenReducer', () => {
         state,
       );
 
-      expect(get(newState, ['sent', secrethash, 'transfer', 1])).toBe(transfer);
-      expect(get(newState, ['secrets', secrethash])).toBeUndefined();
+      expect(newState.sent[secrethash].transfer[1]).toBe(transfer);
+      expect(newState.sent[secrethash].secret).toBeUndefined();
 
       newState = [
         channelClose.success(
@@ -1172,17 +1210,19 @@ describe('raidenReducer', () => {
 
     test('transfer cleared', () => {
       let newState = [
-        transferSecret({ secret }, { secrethash }),
         transferSigned({ message: transfer, fee }, { secrethash }),
+        transferSecret({ secret }, { secrethash }),
       ].reduce(raidenReducer, state);
 
-      expect(get(newState, ['sent', secrethash, 'transfer', 1])).toBe(transfer);
-      expect(get(newState, ['secrets', secrethash, 'secret'])).toBe(secret);
+      expect(newState.sent[secrethash].transfer[1]).toBe(transfer);
+      expect(newState.sent[secrethash].secret).toStrictEqual([
+        expect.any(Number),
+        { value: secret, registerBlock: 0 },
+      ]);
 
       newState = [transferClear(undefined, { secrethash })].reduce(raidenReducer, newState);
 
-      expect(get(newState, ['sent', secrethash])).toBeUndefined();
-      expect(get(newState, ['secrets', secrethash])).toBeUndefined();
+      expect(newState.sent[secrethash]).toBeUndefined();
     });
 
     // withdraw request is under transfer just to use its pending transfer setup/vars
@@ -1283,6 +1323,49 @@ describe('raidenReducer', () => {
           get(newState2.channels, [tokenNetwork, partner, 'own', 'balanceProof', 'nonce']),
         ).toEqual(prevNonce.add(1));
       });
+    });
+  });
+
+  describe('pendingTxs', () => {
+    const pending = channelDeposit.success(
+      {
+        id: channelId,
+        participant: partner,
+        totalDeposit: bigNumberify(12) as UInt<32>,
+        txHash,
+        txBlock: openBlock + 2,
+        confirmed: undefined,
+      },
+      { tokenNetwork, partner },
+    );
+
+    test('pending action added to queue', () => {
+      expect(state.pendingTxs).toEqual([]);
+      expect(raidenReducer(state, pending).pendingTxs).toEqual([pending]);
+    });
+
+    test('confirmed tx cleans pending', () => {
+      const pendingState = raidenReducer(state, pending);
+      const confirmed = { ...pending, payload: { ...pending.payload, confirmed: true } };
+      expect(raidenReducer(pendingState, confirmed).pendingTxs).toEqual([]);
+    });
+
+    test("confirmed tx doesn't clean other pending txs on same channel", () => {
+      const pending2 = {
+        ...pending,
+        payload: { ...pending.payload, txHash: keccak256(txHash) as Hash, txBlock: openBlock + 3 },
+      };
+      const pendingState = [pending, pending2].reduce(raidenReducer, state);
+      expect(pendingState.pendingTxs).toEqual([pending, pending2]);
+
+      const confirmed = { ...pending, payload: { ...pending.payload, confirmed: true } };
+      expect(raidenReducer(pendingState, confirmed).pendingTxs).toEqual([pending2]);
+    });
+
+    test('noop action returns same object', () => {
+      // no pending in state for this confirmation == noop
+      const confirmed = { ...pending, payload: { ...pending.payload, confirmed: true } };
+      expect(raidenReducer(state, confirmed).pendingTxs).toBe(state.pendingTxs);
     });
   });
 });

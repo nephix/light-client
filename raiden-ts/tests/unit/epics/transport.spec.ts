@@ -47,6 +47,7 @@ import { encodeJsonMessage, signMessage } from 'raiden-ts/messages/utils';
 import { epicFixtures } from '../fixtures';
 import { raidenEpicDeps } from '../mocks';
 import { pluckDistinct } from 'raiden-ts/utils/rx';
+import { ErrorCodes } from 'raiden-ts/utils/error';
 
 describe('transport epic', () => {
   let depsMock: ReturnType<typeof raidenEpicDeps>,
@@ -151,7 +152,7 @@ describe('transport epic', () => {
         state$ = depsMock.latest$.pipe(pluckDistinct('state'));
 
       depsMock.latest$.pipe(first()).subscribe(l => {
-        const state = raidenReducer(l.state, raidenConfigUpdate({ config: { matrixServer } }));
+        const state = raidenReducer(l.state, raidenConfigUpdate({ matrixServer }));
         depsMock.latest$.next({ ...l, state, config: { ...l.config, ...state.config } });
       });
 
@@ -189,7 +190,7 @@ describe('transport epic', () => {
               displayName,
             },
           }),
-          raidenConfigUpdate({ config: { matrixServer } }),
+          raidenConfigUpdate({ matrixServer }),
         ].reduce(raidenReducer, l.state);
         depsMock.latest$.next({ ...l, state, config: { ...l.config, ...state.config } });
       });
@@ -278,7 +279,7 @@ describe('transport epic', () => {
         text: jest.fn(async () => ''),
       });
       await expect(initMatrixEpic(action$, state$, depsMock).toPromise()).rejects.toThrow(
-        'Could not contact any matrix servers',
+        ErrorCodes.TRNS_NO_MATRIX_SERVERS,
       );
       expect(fetch).toHaveBeenCalledTimes(2);
     });
@@ -895,7 +896,7 @@ describe('transport epic', () => {
   });
 
   describe('matrixMessageSendEpic', () => {
-    beforeEach(() => action$.next(raidenConfigUpdate({ config: { httpTimeout: 30 } })));
+    beforeEach(() => action$.next(raidenConfigUpdate({ httpTimeout: 30 })));
 
     test('send: all needed parts in place, errors once but retries successfully', async () => {
       expect.assertions(3);

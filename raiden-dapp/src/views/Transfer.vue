@@ -1,13 +1,8 @@
 <template>
   <v-form v-model="valid" autocomplete="off" class="transfer">
     <v-container fluid class="transfer__settings">
-      <v-row
-        align="center"
-        justify="center"
-        no-gutters
-        class="transfer__actions"
-      >
-        <v-col cols="2" class="transfer__channels">
+      <v-row justify="center" no-gutters class="transfer__actions">
+        <v-col cols="3" sm="2" class="transfer__channels">
           <v-btn
             text
             class="transfer__channel-button"
@@ -45,7 +40,7 @@
             @cancel="showTokenNetworks = false"
           />
         </v-col>
-        <v-col cols="2" class="transfer__deposit">
+        <v-col cols="3" sm="2" class="transfer__deposit">
           <v-btn
             text
             class="transfer__deposit-button"
@@ -66,7 +61,7 @@
       </v-row>
 
       <v-row justify="center" align="center" class="transfer__recipient">
-        <v-col cols="10">
+        <v-col cols="12" sm="10">
           <address-input
             v-model="target"
             :exclude="[token.address, defaultAccount]"
@@ -76,7 +71,7 @@
       </v-row>
 
       <v-row justify="center" align="center">
-        <v-col cols="10">
+        <v-col cols="12" sm="10">
           <amount-input
             v-model="amount"
             :token="token"
@@ -99,11 +94,7 @@
       ></action-button>
     </v-container>
 
-    <error-dialog
-      :description="error"
-      :title="errorTitle"
-      @dismiss="error = ''"
-    ></error-dialog>
+    <error-dialog :error="error" @dismiss="error = null"></error-dialog>
   </v-form>
 </template>
 
@@ -122,7 +113,7 @@ import ChannelDepositDialog from '@/components/ChannelDepositDialog.vue';
 import DownArrow from '@/components/icons/DownArrow.vue';
 import { BigNumber } from 'ethers/utils';
 import { mapGetters, mapState } from 'vuex';
-import { RaidenChannel, ChannelState } from 'raiden-ts';
+import { RaidenChannel, ChannelState, RaidenError } from 'raiden-ts';
 import { Zero } from 'ethers/constants';
 import AddressUtils from '@/utils/address-utils';
 import NavigationMixin from '@/mixins/navigation-mixin';
@@ -159,8 +150,7 @@ export default class Transfer extends Mixins(BlockieMixin, NavigationMixin) {
   done: boolean = false;
   depositing: boolean = false;
 
-  errorTitle: string = '';
-  error: string = '';
+  error: Error | RaidenError | null = null;
 
   channels!: (tokenAddress: string) => RaidenChannel[];
 
@@ -211,7 +201,6 @@ export default class Transfer extends Mixins(BlockieMixin, NavigationMixin) {
 
   async deposit(amount: BigNumber) {
     this.loading = true;
-    this.errorTitle = this.$t('transfer.error.deposit-title') as string;
 
     try {
       await this.$raiden.deposit(
@@ -223,7 +212,7 @@ export default class Transfer extends Mixins(BlockieMixin, NavigationMixin) {
       this.loading = false;
       this.dismissProgress();
     } catch (e) {
-      this.error = e.message;
+      this.error = e;
       this.loading = false;
       this.depositing = false;
     }
@@ -240,10 +229,17 @@ export default class Transfer extends Mixins(BlockieMixin, NavigationMixin) {
 
 <style lang="scss" scoped>
 @import '../scss/colors';
+@import '../scss/mixins';
+@import '../scss/fonts';
 
 .transfer {
   width: 100%;
   height: 100%;
+
+  &__channels,
+  &__deposit {
+    margin-top: 29px;
+  }
 
   &__actions {
     margin-top: 10px;
@@ -251,6 +247,10 @@ export default class Transfer extends Mixins(BlockieMixin, NavigationMixin) {
 
   &__recipient {
     margin-top: 75px;
+
+    @include respond-to(handhelds) {
+      margin-top: 0;
+    }
 
     &__label {
       color: $secondary-color;
@@ -275,6 +275,10 @@ export default class Transfer extends Mixins(BlockieMixin, NavigationMixin) {
   &__deposit-button {
     color: $primary-color;
     text-transform: none;
+    font-size: 16px;
+    letter-spacing: 1px;
+    font-weight: 500;
+    font-family: $main-font;
   }
 
   &__token-networks {
@@ -291,7 +295,10 @@ export default class Transfer extends Mixins(BlockieMixin, NavigationMixin) {
     &__dropdown {
       color: $primary-color;
       font-size: 16px;
-      margin-top: 5px;
+      letter-spacing: 1px;
+      font-weight: 500;
+      font-family: $main-font;
+      margin-top: 7px;
       cursor: pointer;
       text-align: center;
 

@@ -1,18 +1,16 @@
+import Filters from '@/filters';
+
 jest.mock('@/services/raiden-service');
 jest.mock('vue-router');
 jest.useFakeTimers();
 
 import VueRouter, { NavigationGuard } from 'vue-router';
 import flushPromises from 'flush-promises';
-import { createLocalVue, mount, shallowMount, Wrapper } from '@vue/test-utils';
+import { mount, shallowMount, Wrapper } from '@vue/test-utils';
 import OpenChannel from '@/views/OpenChannel.vue';
 import Vue from 'vue';
 import Vuetify from 'vuetify';
 import { TestData } from '../data/mock-data';
-import RaidenService, {
-  ChannelDepositFailed,
-  ChannelOpenFailed
-} from '@/services/raiden-service';
 import store from '@/store/index';
 import NavigationMixin from '@/mixins/navigation-mixin';
 import { RouteNames } from '@/router/route-names';
@@ -21,12 +19,16 @@ import { Token } from '@/model/types';
 import { Tokens } from '@/types';
 import { mockInput } from '../utils/interaction-utils';
 import { parseUnits } from 'ethers/utils';
+import { RaidenError, ErrorCodes } from 'raiden-ts';
+import RaidenService from '@/services/raiden-service';
 
 Vue.use(Vuetify);
+Vue.filter('truncate', Filters.truncate);
 
 describe('OpenChannel.vue', () => {
   let service: Mocked<RaidenService>;
   let wrapper: Wrapper<OpenChannel>;
+  let vuetify: typeof Vuetify;
   let button: Wrapper<Vue>;
   let router: Mocked<VueRouter>;
 
@@ -37,10 +39,10 @@ describe('OpenChannel.vue', () => {
     },
     shallow: boolean = false
   ): Wrapper<OpenChannel> {
-    const localVue = createLocalVue();
     const options = {
-      localVue,
+      vuetify,
       store,
+      stubs: ['v-dialog'],
       propsData: {
         current: 0
       },
@@ -49,7 +51,8 @@ describe('OpenChannel.vue', () => {
         $raiden: service,
         $router: router,
         $route: TestData.mockRoute(routeParams),
-        $t: (msg: string) => msg
+        $t: (msg: string) => msg,
+        $te: (msg: string) => msg
       }
     };
 
@@ -88,7 +91,7 @@ describe('OpenChannel.vue', () => {
         partner: '0x1D36124C90f53d491b6832F1c073F43E2550E35b'
       });
 
-      button = wrapper.find('button');
+      button = wrapper.find('button.action-button__button');
       await wrapper.vm.$nextTick();
       service.openChannel = jest.fn();
     });
@@ -104,7 +107,7 @@ describe('OpenChannel.vue', () => {
 
     test('show an error when a channel open fails', async () => {
       service.openChannel.mockRejectedValueOnce(
-        new ChannelOpenFailed('open: transaction failed')
+        new RaidenError(ErrorCodes.CNL_OPENCHANNEL_FAILED)
       );
 
       mockInput(wrapper, '0.1');
@@ -113,20 +116,24 @@ describe('OpenChannel.vue', () => {
       button.trigger('click');
       await wrapper.vm.$nextTick();
       await flushPromises();
-      expect(wrapper.vm.$data.error).toBe('open-channel.error.open-failed');
+      expect(wrapper.vm.$data.error).toMatchObject({
+        code: 'CNL_OPENCHANNEL_FAILED'
+      });
       await flushPromises();
     });
 
     test('show an error when the deposit fails', async () => {
       service.openChannel.mockRejectedValueOnce(
-        new ChannelDepositFailed('deposit: transaction failed')
+        new RaidenError(ErrorCodes.RDN_DEPOSIT_TRANSACTION_FAILED)
       );
 
       mockInput(wrapper, '0.1');
       button.trigger('click');
       await wrapper.vm.$nextTick();
       await flushPromises();
-      expect(wrapper.vm.$data.error).toBe('open-channel.error.deposit-failed');
+      expect(wrapper.vm.$data.error).toMatchObject({
+        code: 'RDN_DEPOSIT_TRANSACTION_FAILED'
+      });
       await flushPromises();
     });
 
@@ -136,7 +143,7 @@ describe('OpenChannel.vue', () => {
       button.trigger('click');
       await wrapper.vm.$nextTick();
       await flushPromises();
-      expect(wrapper.vm.$data.error).toBe('unknown');
+      expect(wrapper.vm.$data.error).toMatchObject({ message: 'unknown' });
       await flushPromises();
     });
 
