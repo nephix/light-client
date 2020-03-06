@@ -10,7 +10,7 @@ import { Wallet } from 'ethers';
 import { BigNumberish } from 'ethers/utils';
 import express, { Express } from 'express';
 
-import { Raiden, RaidenChannel, RaidenSentTransfer } from 'raiden-ts';
+import { Raiden, RaidenChannel, RaidenTransfer } from 'raiden-ts';
 
 let raiden: Raiden;
 let app: Express;
@@ -70,7 +70,7 @@ async function transfer(token: string, target: string, value: BigNumberish) {
   let revealAt: number;
   let unlockAt: number;
   const tId = await raiden.transfer(token, target, value);
-  const t = await new Promise<RaidenSentTransfer>((resolve, reject) => {
+  const t = await new Promise<RaidenTransfer>((resolve, reject) => {
     const sub = raiden.transfers$.subscribe(t => {
       if (t.secrethash !== tId) return;
       console.log('Transfer:', t);
@@ -146,11 +146,22 @@ async function setupApi(port: number) {
     res.json({ our_address: raiden.address });
   });
 
-  app.post(`${api}/payments/:token/:target`, (req, res) => {
-    transfer(req.params.token, req.params.target, req.body.amount).then(
-      tr => res.json(tr),
-      err => res.status(400).json(err),
+  app.post(`${api}/payments/:token/:target`, async (req, res) => {
+    console.log(
+      `HTTP POST /payments: token="${req.params.token}", target="${req.params.target}", amount="${req.body.amount}"`,
     );
+    const availability = await raiden.getAvailability(req.params.target);
+    if (!availability.available) {
+      res.status(400).json(availability);
+    } else {
+      transfer(req.params.token, req.params.target, req.body.amount).then(
+        tr => {
+          console.log('RaidenTransfer', tr);
+          res.json(tr);
+        },
+        err => res.status(400).json(err),
+      );
+    }
   });
 
   app.post(`${api}/config`, (req, res) => {
@@ -250,7 +261,12 @@ async function main() {
   const localStorage = new LocalStorage(argv.store);
   Object.assign(globalThis, { localStorage });
 
-  raiden = await Raiden.create(argv.ethNode, pk.privateKey, localStorage, undefined, argv.config);
+  raiden = await Raiden.create(argv.ethNode, pk.privateKey, localStorage, undefined, {
+    ...argv.config,
+    pfsSafetyMargin: 1.1,
+    pfs: 'https://pfs.raidentransport.test001.env.raiden.network',
+    matrixServer: 'https://raidentransport.test001.env.raiden.network',
+  });
 
   process.on('SIGINT', () => {
     if (raiden.started === false) process.exit(1);
