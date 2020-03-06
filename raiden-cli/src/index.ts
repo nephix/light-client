@@ -15,6 +15,7 @@ import { Raiden, RaidenChannel, RaidenTransfer } from 'raiden-ts';
 let raiden: Raiden;
 let app: Express;
 let server: Server;
+const globalThis = this;
 
 async function waitStarted() {
   const start = Date.now();
