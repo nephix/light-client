@@ -30,17 +30,14 @@
       ],
       "ethers/*": [
         "node_modules/ethers/*"
-      ]
+      ],
+      "matrix-js-sdk": ["node_modules/raiden-ts/node_modules/@types/matrix-js-sdk/index.d.ts"]
     },
     "lib": [
       "esnext",
       "dom",
       "dom.iterable",
       "scripthost"
-    ],
-    "typeRoots": [
-      "./node_modules/@types",
-      "./node_modules/raiden-ts/typings"
     ]
   },
   "include": [
