@@ -1,5 +1,5 @@
-import { promises as fs } from 'fs';
-import * as path from 'path';
+const fsPromises = require('fs').promises;
+const path = require('path');
 import { Server } from 'http';
 
 import readline from 'readline-sync';
@@ -254,7 +254,7 @@ async function main() {
     argv.password = readline.question('Private Key Password: ', { hideEchoBack: true });
 
   const pk = await Wallet.fromEncryptedJson(
-    await fs.readFile(argv.privateKey, 'utf-8'),
+    await fsPromises.readFile(argv.privateKey, 'utf-8'),
     argv.password,
   );
   console.log('Address:', pk.address);
